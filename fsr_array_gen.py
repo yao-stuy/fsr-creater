@@ -207,6 +207,7 @@ for flip in (0, 1):
             pads.append(dict(num=p.GetNumber(),
                              x=pcbnew.ToMM(p.GetPosition().x),
                              y=pcbnew.ToMM(p.GetPosition().y),
+                             bot=pcbnew.ToMM(p.GetBoundingBox().GetBottom()),
                              thru=p.GetAttribute() in (pcbnew.PAD_ATTRIB_PTH,
                                                        pcbnew.PAD_ATTRIB_NPTH),
                              front=p.IsOnLayer(pcbnew.F_Cu)))
@@ -250,6 +251,7 @@ class Gen:
         self.lib_adds = []          # KiCad-library footprints for pcbnew
         self.gen_lib = {}           # generated footprints -> project FSR.pretty
         self._slack, self._iter = 0.0, 0    # board-dims auto-fit refinement
+        self.drc_expected = {}              # extra by-design DRC annotations
         self.resolve_geometry()
 
     # ---------- geometry resolution ----------
@@ -470,8 +472,29 @@ class Gen:
             min_h = self.row_deep + 1.5      # body hugs the routing: no
         else:                                # empty strip before the tail
             tail = 3.0
-            if self.libbox is not None:      # keep whole footprint on board
-                tail = max(tail, self.libbox[1] - self._lib_ymid + 1.0)
+            self.overhang = 0.0
+            if self.libbox is not None:
+                if a.connector_angle == "horizontal":
+                    # right-angle: only the solder area sits on the board;
+                    # the body/entry hangs out past the edge
+                    tail = max(2.0, self.lib_pad_bot - self._lib_ymid
+                               + (1.0 if self.lib_any_thru else 0.7))
+                    self.overhang = max(
+                        0.0, self.libbox[1] - self._lib_ymid - tail)
+                    if self.overhang > 0.05:
+                        self.drc_expected["silk_edge_clearance"] = (
+                            "expected: right-angle connector body overhangs "
+                            "the board edge")
+                    if (self._lib_ymid - self.libbox[0]
+                            > self.libbox[1] - self._lib_ymid):
+                        self.warnings.append(
+                            f"{self.lib_spec}: this footprint's entry faces "
+                            "the board interior at the pin-1-left rotation; "
+                            "cables will run over the board. Use jst-xh / "
+                            "jst-ph horizontal for edge-exit, or rotate J1 "
+                            "yourself in KiCad")
+                else:                        # keep whole footprint on board
+                    tail = max(tail, self.libbox[1] - self._lib_ymid + 1.0)
                 if self.lib_flip:
                     # connector copper/body is on B.Cu with the row fans:
                     # keep the fan band above the whole footprint extent
@@ -510,6 +533,10 @@ class Gen:
                      f"pads, need {self.n_pads}")
         self.libpads = self.libpads[:self.n_pads]
         self.libbox = (d["top"], d["bottom"], d["left"], d["right"])
+        # deepest pad copper incl. unnumbered anchor (MP) pads — they must
+        # all stay on the board even when the body overhangs the edge
+        self.lib_pad_bot = max(p["bot"] for p in d["pads"])
+        self.lib_any_thru = any(p["thru"] for p in d["pads"])
         self.conn["kind"] = "lib"
 
     def bus_x(self, c):
@@ -654,13 +681,20 @@ class Gen:
             if self.a.connector != "zif":       # bottom pair flanks connector
                 bx0 = self.conn_ext[0] - (self.hole_half + 0.6)
                 bx1 = self.conn_ext[1] + (self.hole_half + 0.6)
-                by = min(self.pad_y, self.board_h - self.hole_d / 2 - 1.4)
-                if bx0 - self.hole_half - 0.5 > 0 and \
-                   bx1 + self.hole_half + 0.5 < self.board_w:
-                    pts += [(bx0, by), (bx1, by)]
-                else:
+                # below the row fan band, above the board edge
+                by_min = self.row_deep + self.hole_d / 2 + 0.55
+                by_max = self.board_h - self.hole_d / 2 - 0.9
+                by = max(min(self.pad_y, by_max), by_min)
+                if not (bx0 - self.hole_half - 0.5 > 0 and
+                        bx1 + self.hole_half + 0.5 < self.board_w):
                     self.warnings.append("board too narrow for bottom mounting "
                                          "holes; only top pair placed")
+                elif by > by_max:
+                    self.warnings.append("no room between fan-out and board "
+                                         "edge for bottom mounting holes; "
+                                         "only top pair placed")
+                else:
+                    pts += [(bx0, by), (bx1, by)]
             self.hole_pts = pts
             spec = f"MountingHole:{self.hole_fp}"
             if self.hole_lib:
@@ -969,6 +1003,10 @@ class Gen:
                      "side of the board"
                      + ("" if a.connector_mount == "smd" else
                         "; through-hole: insert from that side"))
+            if getattr(self, "overhang", 0) > 0.05:
+                L.append(f"  Body/entry overhangs the board edge by "
+                         f"{self.overhang:.1f} mm - only the solder pads "
+                         "sit on the board")
         if self.lib_spec:
             L.append(f"  KiCad footprint used: {self.lib_spec}"
                      + (f" (rotated {self.lib_rot} deg)" if self.lib_rot else ""))
@@ -1072,10 +1110,12 @@ EXPECTED_DRC = {
 }
 
 
-def run_drc(pcb_path, rpt_path):
+def run_drc(pcb_path, rpt_path, extra_expected=None):
     if not KICAD["cli"]:
         print("kicad-cli not found; skipping DRC")
         return
+    expected = dict(EXPECTED_DRC)
+    expected.update(extra_expected or {})
     subprocess.run([KICAD["cli"], "pcb", "drc", "--severity-error",
                     "--severity-warning", "--format", "report",
                     "--output", rpt_path, pcb_path],
@@ -1091,8 +1131,8 @@ def run_drc(pcb_path, rpt_path):
     print(f"\nDRC ({os.path.basename(rpt_path)} has full details — nothing suppressed):")
     real = 0
     for t, n in sorted(counts.items(), key=lambda kv: -kv[1]):
-        note = EXPECTED_DRC.get(t, ">>> REVIEW — not expected for this design <<<")
-        if t not in EXPECTED_DRC:
+        note = expected.get(t, ">>> REVIEW — not expected for this design <<<")
+        if t not in expected:
             real += n
         print(f"  {n:4d}  {t:24s} {note}")
     if not counts:
@@ -1239,7 +1279,7 @@ def main():
         f.write(info + "\n")
     print("\n" + info)
 
-    run_drc(pcb, os.path.join(folder, "drc.rpt"))
+    run_drc(pcb, os.path.join(folder, "drc.rpt"), gen.drc_expected)
     export_outputs(folder, name)
     print(f"\nProject folder: {folder}/")
     for f in sorted(os.listdir(folder)):
