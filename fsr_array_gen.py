@@ -96,7 +96,9 @@ CONNECTORS = {
         kind="tht", pitch=2.54, pad=1.7, drill=1.0,
         label="Pin header 2.54 mm",
         lib="Connector_PinHeader_2.54mm:PinHeader_1x{n}_P2.54mm_Vertical",
-        order=["Generic male pin header, 1x{n}, 2.54 mm pitch, through-hole",
+        lib_smd="Connector_PinHeader_2.54mm:"
+                "PinHeader_1x{n}_P2.54mm_Vertical_SMD_Pin1Left",
+        order=["Generic male pin header, 1x{n}, 2.54 mm pitch, {mount}",
                "  e.g. Wurth 61301611121 family or any breakaway header",
                "  Mates with: standard 2.54 mm DuPont / jumper-wire housings"]),
     "jst-xh": dict(
@@ -104,14 +106,16 @@ CONNECTORS = {
         label="JST XH (B{n}B-XH-A)",
         lib="Connector_JST:JST_XH_B{n}B-XH-A_1x{n}_P2.50mm_Vertical",
         order=["JST XH top-entry shrouded header, MPN: B{n}B-XH-A",
-               "  {n} pins, 2.50 mm pitch, through-hole",
+               "  {n} pins, 2.50 mm pitch, {mount}",
                "  Mates with: XHP-{n} housing + SXH-001T-P0.6 crimp contacts"]),
     "jst-ph": dict(
         kind="tht", pitch=2.00, pad=1.3, drill=0.75,
         label="JST PH (B{n}B-PH-K)",
         lib="Connector_JST:JST_PH_B{n}B-PH-K_1x{n}_P2.00mm_Vertical",
-        order=["JST PH top-entry header, MPN: B{n}B-PH-K",
-               "  {n} pins, 2.00 mm pitch, through-hole",
+        lib_smd="Connector_JST:JST_PH_B{n}B-PH-SM4-TB_1x{n}-1MP_P2.00mm_Vertical",
+        order=["JST PH top-entry header, MPN: B{n}B-PH-K "
+               "(SMD variant: B{n}B-PH-SM4-TB)",
+               "  {n} pins, 2.00 mm pitch, {mount}",
                "  Mates with: PHR-{n} housing + SPH-002T-P0.5S crimp contacts"]),
     "zif": dict(
         kind="zif", pitch=1.25, pad=0.55, drill=0,
@@ -187,22 +191,28 @@ def dump_lib_footprint(spec):
     out = kicad_py(f"""
 import pcbnew, json
 res = {{}}
-for rot in (0, 90, 180, 270):
-    fp = pcbnew.FootprintLoad({libdir!r}, {name!r})
-    fp.SetOrientationDegrees(rot)
-    pads = []
-    for p in fp.Pads():
-        pads.append(dict(num=p.GetNumber(),
-                         x=pcbnew.ToMM(p.GetPosition().x),
-                         y=pcbnew.ToMM(p.GetPosition().y),
-                         thru=p.GetAttribute() in (pcbnew.PAD_ATTRIB_PTH,
-                                                   pcbnew.PAD_ATTRIB_NPTH),
-                         front=p.IsOnLayer(pcbnew.F_Cu)))
-    bb = fp.GetBoundingBox(False)   # exclude text: ref/value inflate the box
-    res[str(rot)] = dict(pads=pads, top=pcbnew.ToMM(bb.GetTop()),
-                         bottom=pcbnew.ToMM(bb.GetBottom()),
-                         left=pcbnew.ToMM(bb.GetLeft()),
-                         right=pcbnew.ToMM(bb.GetRight()))
+for flip in (0, 1):
+    for rot in (0, 90, 180, 270):
+        fp = pcbnew.FootprintLoad({libdir!r}, {name!r})
+        b = pcbnew.BOARD()
+        b.Add(fp)                       # Flip needs a board context
+        if flip:
+            fp.Flip(pcbnew.VECTOR2I(0, 0), pcbnew.FLIP_DIRECTION_LEFT_RIGHT)
+        fp.SetOrientationDegrees(rot)
+        pads = []
+        for p in fp.Pads():
+            pads.append(dict(num=p.GetNumber(),
+                             x=pcbnew.ToMM(p.GetPosition().x),
+                             y=pcbnew.ToMM(p.GetPosition().y),
+                             thru=p.GetAttribute() in (pcbnew.PAD_ATTRIB_PTH,
+                                                       pcbnew.PAD_ATTRIB_NPTH),
+                             front=p.IsOnLayer(pcbnew.F_Cu)))
+        bb = fp.GetBoundingBox(False)   # exclude text: it inflates the box
+        res[str(rot) + ("f" if flip else "")] = dict(
+            pads=pads, top=pcbnew.ToMM(bb.GetTop()),
+            bottom=pcbnew.ToMM(bb.GetBottom()),
+            left=pcbnew.ToMM(bb.GetLeft()),
+            right=pcbnew.ToMM(bb.GetRight()))
 print(json.dumps(res))""")
     if not out:
         sys.exit(f"could not load footprint {spec}")
@@ -210,18 +220,22 @@ print(json.dumps(res))""")
     return _DUMP_CACHE[spec]
 
 
-def pick_rotation(dumps, n_need):
-    """Choose the rotation where numbered pads form one left-to-right row."""
-    for rot in ("0", "90", "270", "180"):
-        pads = [p for p in dumps[rot]["pads"] if p["num"].isdigit()]
-        pads.sort(key=lambda p: int(p["num"]))
-        pads = pads[:n_need]
-        if len(pads) < n_need:
-            return None, None
-        ys = [p["y"] for p in pads]
-        xs = [p["x"] for p in pads]
-        if max(ys) - min(ys) < 0.05 and all(b > a for a, b in zip(xs, xs[1:])):
-            return int(rot), dumps[rot]
+def pick_rotation(dumps, n_need, flip=False):
+    """Choose the rotation where numbered pads run left-to-right: one row
+    preferred, then a loose pass for staggered-row (SMD header) pads."""
+    sfx = "f" if flip else ""
+    for tol in (0.05, 4.0):
+        for rot in ("0", "90", "270", "180"):
+            d = dumps[rot + sfx]
+            pads = [p for p in d["pads"] if p["num"].isdigit()]
+            pads.sort(key=lambda p: int(p["num"]))
+            pads = pads[:n_need]
+            if len(pads) < n_need:
+                return None, None
+            ys = [p["y"] for p in pads]
+            xs = [p["x"] for p in pads]
+            if max(ys) - min(ys) <= tol and all(b > a for a, b in zip(xs, xs[1:])):
+                return int(rot), d
     return None, None
 
 
@@ -270,24 +284,39 @@ class Gen:
         self.conn = dict(CONNECTORS[a.connector])
         if a.connector_pitch:
             self.conn["pitch"] = a.connector_pitch
+        # contacts: for zif = which face carries fingers; for everything
+        # else = which side of the board the connector mounts on
+        self.conn_side = a.contacts
+        if a.connector != "zif" and a.contacts == "both":
+            self.warnings.append("'both' contacts only applies to the ZIF "
+                                 "tail; connector mounted on top")
+            self.conn_side = "top"
+        flip = a.connector != "zif" and self.conn_side == "bottom"
         self.lib_spec, self.lib_rot, self.libpads, self.libbox = None, 0, None, None
+        self.lib_flip = flip
         if a.connector == "lib":
             if not a.connector_footprint:
                 sys.exit("--connector lib requires --connector-footprint LIB:NAME "
                          "(discover names with --list-connectors)")
-            self._load_lib_connector(a.connector_footprint)
-        elif self.conn.get("lib") and not a.connector_pitch:
-            spec = self.conn["lib"].format(n=self.n_pads)
-            if lib_exists(spec) and KICAD["python"]:
-                self._load_lib_connector(spec)
+            self._load_lib_connector(a.connector_footprint, flip)
+        elif a.connector != "zif" and not a.connector_pitch:
+            tpl = self.conn.get("lib_smd" if a.connector_mount == "smd"
+                                else "lib")
+            spec = tpl.format(n=self.n_pads) if tpl else None
+            if spec and lib_exists(spec) and KICAD["python"]:
+                self._load_lib_connector(spec, flip)
             else:
                 self.warnings.append(
-                    f"{spec} not in KiCad library (or pcbnew unavailable); "
-                    "using a generated footprint instead")
-        elif a.connector_pitch and self.conn.get("lib"):
+                    f"{spec or a.connector + ' (SMD)'} not in KiCad library "
+                    "(or pcbnew unavailable); using a generated footprint")
+                if a.connector_mount == "smd":
+                    self.conn["kind"] = "smd"
+        elif a.connector_pitch and a.connector != "zif":
             self.warnings.append(
                 "custom --connector-pitch given: using a generated footprint "
                 "instead of the KiCad library part")
+            if a.connector_mount == "smd":
+                self.conn["kind"] = "smd"
 
         # --- side margins: row escapes split left/right ---
         # Fine-pitch (<0.9 mm) ZIF: vias can't fit between the drop columns,
@@ -400,7 +429,7 @@ class Gen:
                 self.warnings.append("tail length clamped to 5.0 mm minimum")
             # top/both contacts need a via inside each live finger to bond
             # the two faces; those vias only fit at >= 0.8 mm pitch
-            self.tail_contacts = a.tail_contacts
+            self.tail_contacts = a.contacts
             if self.conn["pitch"] < 0.8 and self.tail_contacts != "bottom":
                 self.warnings.append(
                     f"tail contacts forced to 'bottom': finger vias do not "
@@ -438,6 +467,12 @@ class Gen:
             tail = 3.0
             if self.libbox is not None:      # keep whole footprint on board
                 tail = max(tail, self.libbox[1] - self._lib_ymid + 1.0)
+                if self.lib_flip:
+                    # connector copper/body is on B.Cu with the row fans:
+                    # keep the fan band above the whole footprint extent
+                    self.drop_gap = max(
+                        self.drop_gap,
+                        self._lib_ymid - self.libbox[0] + 0.6)
             min_h = self.row_deep + self.drop_gap + tail
         self.board_h = a.board_h or min_h
         # board-dims auto-fit: the sensor height came from an estimate;
@@ -454,11 +489,11 @@ class Gen:
         self.pad_y = (self.board_h + self.tail_len - 2.0
                       if a.connector == "zif" else self.board_h - tail)
 
-    def _load_lib_connector(self, spec):
+    def _load_lib_connector(self, spec, flip=False):
         dumps = dump_lib_footprint(spec)
-        rot, d = pick_rotation(dumps, self.n_pads)
+        rot, d = pick_rotation(dumps, self.n_pads, flip)
         if rot is None:
-            rot, d = 0, dumps["0"]
+            rot, d = 0, dumps["0f" if flip else "0"]
             self.warnings.append(
                 f"{spec}: pads are not one ascending row at any rotation; "
                 "placed at 0 deg - REVIEW the connector area in KiCad")
@@ -671,6 +706,17 @@ class Gen:
         w = self.drop_w
         if kind == "tht":
             self.seg(px, y_fan, px, self.pad_y, from_layer, net, w)
+        elif kind == "smd":
+            front = self.conn_side == "top"
+            if (from_layer == "F.Cu") == front:
+                self.seg(px, y_fan, px, self.pad_y, from_layer, net, w)
+            else:
+                yv = (max(self.row_deep + 0.9, self.pad_y - 2.0)
+                      + (0.8 if pad_idx % 2 else 0))
+                self.seg(px, y_fan, px, yv, from_layer, net, w)
+                self.via(px, yv, net)
+                self.seg(px, yv, px, self.pad_y,
+                         "F.Cu" if front else "B.Cu", net, w)
         elif kind == "zif":
             tc = self.tail_contacts
             if tc == "both":
@@ -736,9 +782,14 @@ class Gen:
             return
         if self.conn_pitch_min < 1.8:        # too fine to label per pin
             return
-        ly = self.pad_y + 2.6
-        if ly > self.board_h - 0.9:
-            ly = self.pad_y - 2.6
+        if self.libbox is not None:          # clear the footprint's extent
+            ly = self.pad_y + (self.libbox[1] - self._lib_ymid) + 1.2
+            if ly > self.board_h - 0.9:
+                ly = self.pad_y + (self.libbox[0] - self._lib_ymid) - 1.2
+        else:
+            ly = self.pad_y + 2.6
+            if ly > self.board_h - 0.9:
+                ly = self.pad_y - 2.6
         for i, name in enumerate(self.pad_names()):
             lbl = name.replace("ROW", "R").replace("COL", "C") or "NC"
             self.text(lbl, self.pad_xs[i], ly, "B.SilkS", 0.8)
@@ -752,7 +803,11 @@ class Gen:
             cx = (min(xs) + max(xs)) / 2
             self.lib_adds.append(dict(
                 spec=self.lib_spec, x=self.conn_cx - cx,
-                y=self.pad_y - self._lib_ymid, rot=self.lib_rot, ref="J1",
+                y=self.pad_y - self._lib_ymid, rot=self.lib_rot,
+                flip=self.lib_flip, ref="J1",
+                ref_at=[self.conn_cx,
+                        self.pad_y + self.libbox[0] - self._lib_ymid
+                        - (2.8 if self.lib_flip else 1.4)],
                 nets={p["num"]: nets[i][1] for i, p in enumerate(self.libpads)
                       if nets[i]}))
             self.pin_labels()
@@ -768,6 +823,23 @@ class Gen:
                 [("reference", "J1", -self.pad_dx[0], -4.2, "B.SilkS"),
                  ("value", self.conn["label"].replace("{n}", str(self.n_pads)),
                   -self.pad_dx[0], 2.6, "B.Fab")],
+                pads, self.pad_xs[0], self.pad_y)
+            self.pin_labels()
+        elif kind == "smd":
+            front = self.conn_side == "top"
+            lay = '"F.Cu" "F.Mask" "F.Paste"' if front else \
+                  '"B.Cu" "B.Mask" "B.Paste"'
+            pw = min(self.conn["pitch"] * 0.5, 1.2)
+            pads = [dict(num=str(i + 1), ptype="smd", shape="rect",
+                         px=self.pad_dx[i] - self.pad_dx[0], py=0,
+                         sx=round(pw, 3), sy=3.0, layers=lay,
+                         net=nets[i]) for i in range(self.n_pads)]
+            self.gen_footprint(
+                f"{a.connector}_smd_1x{self.n_pads}",
+                "F.Cu" if front else "B.Cu", "smd",
+                [("reference", "J1", -self.pad_dx[0], -4.2, "B.SilkS"),
+                 ("value", self.conn["label"].replace("{n}", str(self.n_pads))
+                  + " SMD", -self.pad_dx[0], 2.6, "B.Fab")],
                 pads, self.pad_xs[0], self.pad_y)
             self.pin_labels()
         elif kind == "zif":
@@ -878,7 +950,15 @@ class Gen:
         for line in self.conn.get("order", []):
             L.append("  " + line.format(
                 n=n, pitch=self.conn["pitch"], fp=self.lib_spec or "",
+                mount=("surface-mount" if a.connector_mount == "smd"
+                       else "through-hole"),
                 contacts=cdesc.get(getattr(self, "tail_contacts", ""), "")))
+        if a.connector != "zif":
+            L.append(f"  Mounted on the "
+                     f"{'TOP' if self.conn_side == 'top' else 'BACK'} "
+                     "side of the board"
+                     + ("" if a.connector_mount == "smd" else
+                        " (through-hole: insert from that side)"))
         if self.lib_spec:
             L.append(f"  KiCad footprint used: {self.lib_spec}"
                      + (f" (rotated {self.lib_rot} deg)" if self.lib_rot else ""))
@@ -946,19 +1026,26 @@ def finalize_with_pcbnew(gen, pcb_path):
         nick, name = it["spec"].split(":", 1)
         adds.append(dict(lib=os.path.join(KICAD["fplib"], nick + ".pretty"),
                          name=name, x=it["x"], y=it["y"], rot=it["rot"],
+                         flip=it.get("flip", False),
                          ref=it["ref"], nets=it["nets"],
+                         ref_at=it.get("ref_at"),
                          hide_ref=it.get("hide_ref", False)))
     out = kicad_py(f"""
 import pcbnew, json
 board = pcbnew.LoadBoard({pcb_path!r})
 for it in json.loads({json.dumps(adds)!r}):
     fp = pcbnew.FootprintLoad(it["lib"], it["name"])
+    board.Add(fp)                    # same op order as the dump step
+    if it["flip"]:
+        fp.Flip(pcbnew.VECTOR2I(0, 0), pcbnew.FLIP_DIRECTION_LEFT_RIGHT)
     fp.SetOrientationDegrees(it["rot"])
     fp.SetPosition(pcbnew.VECTOR2I(pcbnew.FromMM(it["x"]), pcbnew.FromMM(it["y"])))
     fp.Reference().SetText(it["ref"])
+    if it["ref_at"]:
+        fp.Reference().SetPosition(pcbnew.VECTOR2I(
+            pcbnew.FromMM(it["ref_at"][0]), pcbnew.FromMM(it["ref_at"][1])))
     if it["hide_ref"]:
         fp.Reference().SetVisible(False)
-    board.Add(fp)
     for p in fp.Pads():
         if p.GetNumber() in it["nets"]:
             p.SetNet(board.FindNet(it["nets"][p.GetNumber()]))
@@ -1054,17 +1141,21 @@ def main():
                    help="default: fpc when --connector zif, else pcb")
     o.add_argument("--connector", choices=list(CONNECTORS), default="tht")
     o.add_argument("--connector-pitch", type=float)
+    o.add_argument("--connector-mount", choices=["tht", "smd"], default="tht",
+                   help="through-hole or surface-mount connector variant "
+                        "(non-ZIF; default tht)")
     o.add_argument("--connector-footprint", metavar="LIB:NAME")
     o.add_argument("--tail-len", type=float, default=6.0,
                    help="ZIF tail length mm (default 6, min 5)")
     o.add_argument("--tail-w", type=float,
                    help="ZIF tail width mm (default: standard FFC width "
                         "= (n_pins+1) x pitch, so it fits a standard socket)")
-    o.add_argument("--tail-contacts", choices=["top", "bottom", "both"],
-                   default="top",
-                   help="which face(s) of the ZIF tail carry contacts "
-                        "(default top: sensor face-up into a top-contact "
-                        "socket; 'both' works with either socket style)")
+    o.add_argument("--contacts", "--tail-contacts", dest="contacts",
+                   choices=["top", "bottom", "both"], default="top",
+                   help="ZIF: which face(s) of the tail carry fingers "
+                        "('both' works with either socket). Other "
+                        "connectors: which side of the board the connector "
+                        "mounts on. Default top.")
     o.add_argument("--list-connectors", metavar="PATTERN", nargs="?", const="")
     o.add_argument("--fixed-pins", action="store_true",
                    help="always use a 16-pin connector (pins 1-8 rows, 9-16 "

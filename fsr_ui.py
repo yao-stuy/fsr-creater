@@ -142,16 +142,21 @@ a.dl { color:var(--acc); }
           <option value="zif">ZIF / FFC tail</option>
           <option value="lib">from KiCad library&hellip;</option>
         </select></div>
+      <div class="f"><label>Mount</label>
+        <select name="connector_mount"><option value="tht">THT</option>
+        <option value="smd">SMD</option></select></div>
       <div class="f"><label>Conn. pitch mm (opt)</label>
         <input name="connector_pitch" placeholder="default"></div>
+    </div>
+    <div class="row">
+      <div class="f"><label>Contacts / side</label>
+        <select name="contacts"><option value="top">top</option>
+        <option value="bottom">bottom</option>
+        <option value="both">both (ZIF only)</option></select></div>
       <div class="f"><label>ZIF tail len mm</label>
         <input name="tail_len" placeholder="6.0"></div>
       <div class="f"><label>ZIF tail width mm</label>
         <input name="tail_w" placeholder="std"></div>
-      <div class="f"><label>Tail contacts</label>
-        <select name="tail_contacts"><option value="top">top</option>
-        <option value="bottom">bottom</option>
-        <option value="both">both</option></select></div>
     </div>
     <div id="libbox">
       <div class="row"><div class="f">
@@ -260,7 +265,8 @@ def run_gen(data):
              "--connector", data.get("connector", "tht"),
              "--mounting-holes", data.get("mounting_holes", "auto"),
              "--hole-size", data.get("hole_size", "m3"),
-             "--tail-contacts", data.get("tail_contacts", "top")]
+             "--connector-mount", data.get("connector_mount", "tht"),
+             "--contacts", data.get("contacts", "top")]
     if data.get("connector") == "lib" and data.get("connector_footprint"):
         args += ["--connector-footprint", data["connector_footprint"]]
     if data.get("fixed_pins"):

@@ -99,10 +99,11 @@ Run `python3 fsr_array_gen.py --help` for the full option reference.
 | Connector | `--connector {tht,jst-xh,jst-ph,zif,lib}` | connector type; resolved to a real KiCad library footprint when available |
 | | `--fixed-pins` | always 16 pins: 1–8 = rows, 9–16 = columns, unused = NC — one cable/readout board fits any array up to 8×8 (ZIF pitch defaults to 1.25 mm) |
 | | `--connector-pitch` | override the connector's default pitch, mm |
+| | `--connector-mount {tht,smd}` | through-hole or surface-mount connector variant (default tht) |
+| | `--contacts {top,bottom,both}` | ZIF: which tail face(s) carry fingers. Other connectors: which side of the board the connector mounts on. Default top |
 | | `--connector-footprint LIB:NAME` | required with `--connector lib` |
 | | `--tail-len` | ZIF/FFC tail length, mm (default 6, min 5) |
 | | `--tail-w` | ZIF/FFC tail width, mm (default: standard FFC width `(n+1)×pitch`, so it fits a standard ZIF slot) |
-| | `--tail-contacts {top,bottom,both}` | which face(s) of the tail carry gold fingers (default top — sensor face-up into a top-contact socket; `both` works with either socket style but needs ≥0.8 mm pitch) |
 | | `--list-connectors PATTERN` | search KiCad's footprint library (space-separated terms, all must match) |
 | Mounting | `--mounting-holes {auto,on,off}` | 4 NPTH corner holes (auto = on for PCB, off for FPC) |
 | | `--hole-size {m2,m2.5,m3,m4}` | screw size for the mounting holes (default M3) |
