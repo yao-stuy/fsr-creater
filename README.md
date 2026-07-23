@@ -11,8 +11,14 @@ have a working pressure-sensing matrix. All fan-out routing lives on the
 back layer, so the front stays a single clean sensing surface.
 
 Each run produces a self-contained project folder: the `.kicad_pcb` /
-`.kicad_pro`, a full DRC report, front/back SVG previews, and a zipped
-gerber set ready to send to a fab.
+`.kicad_pro`, a full DRC report, front/back SVG previews, an
+`ORDER_INFO.txt` with connector part numbers and assembly notes, and a
+zipped gerber set ready to send to a fab.
+
+Connectors and mounting holes are placed as **real KiCad library
+footprints** whenever the library provides a match (pin headers, JST
+XH/PH, mounting holes, or any connector you pick from the library); a
+generated equivalent is used as fallback.
 
 <p align="center">
   <img src="docs/front.png" alt="Front: exposed comb array" width="45%">
@@ -65,7 +71,10 @@ python3 fsr_array_gen.py --sensor-w 100 --sensor-h 60
 python3 fsr_array_gen.py --board-w 80 --board-h 90 --no-mounting-holes
 
 # flexible sensor with a ZIF/FFC tail instead of a through-hole header
-python3 fsr_array_gen.py --style fpc --connector zif --connector-pitch 1.0
+python3 fsr_array_gen.py --style fpc --connector zif --tail-len 12
+
+# JST-XH connector and M2 mounting holes, both from the KiCad library
+python3 fsr_array_gen.py --connector jst-xh --hole-size m2
 
 # find a real connector footprint in KiCad's library, then use it
 python3 fsr_array_gen.py --list-connectors "FFC 1x16 P1.0"
@@ -87,18 +96,24 @@ Run `python3 fsr_array_gen.py --help` for the full option reference.
 | Auto-fit dims | `--sensor-w`, `--sensor-h` | total sensing area (cols × rows direction); derives pitch and sensel size |
 | | `--board-w`, `--board-h` | edge-cut outline; if given without sensor dims, the sensing area stretches to fill the board |
 | Style | `--style {pcb,fpc}` | rigid PCB (1.6 mm) or flex FPC (0.13 mm) |
-| Connector | `--connector {tht,jst-xh,jst-ph,zif,lib}` | connector type |
+| Connector | `--connector {tht,jst-xh,jst-ph,zif,lib}` | connector type; resolved to a real KiCad library footprint when available |
 | | `--connector-pitch` | override the connector's default pitch, mm |
 | | `--connector-footprint LIB:NAME` | required with `--connector lib` |
+| | `--tail-len` | ZIF/FFC tail length, mm (default 6, min 5) |
 | | `--list-connectors PATTERN` | search KiCad's footprint library (space-separated terms, all must match) |
-| Mounting | `--mounting-holes {auto,on,off}` | 4× M3 NPTH corner holes |
+| Mounting | `--mounting-holes {auto,on,off}` | 4 NPTH corner holes (auto = on for PCB, off for FPC) |
+| | `--hole-size {m2,m2.5,m3,m4}` | screw size for the mounting holes (default M3) |
 | Output | `--name` | project name (default `fsr_RxC`) |
 | | `--outdir` | parent directory for the project folder |
 
 If both `--sensor-*` and `--board-*` are given, sensor dimensions win and
 board size is derived from them plus margins. If neither is given, sensels
 are laid out from `--sensel-w/h` and `--pitch` directly and the board is
-sized to fit.
+sized to fit. Anything you don't specify is chosen automatically:
+trace/gap default to 15/15 mil (the finest geometry standard fabs run
+cheaply), the comb is centered and filled with as many fingers as fit,
+and the board outline hugs the routing — a ZIF board's body ends right
+after the fan-out, with no empty strip before the tail.
 
 ## Design details
 
@@ -141,6 +156,8 @@ one, check the coordinates in `<project>/drc.rpt` before ordering boards.
 <project-name>/
   <project-name>.kicad_pcb   # open directly in KiCad 10
   <project-name>.kicad_pro
+  ORDER_INFO.txt             # connector MPN/pitch, mating parts, hole sizes,
+                             # fab notes — everything needed to order
   drc.rpt                    # full, unfiltered DRC report
   preview_front.svg
   preview_back.svg

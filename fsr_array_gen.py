@@ -7,6 +7,7 @@ Creates a project folder containing:
     <name>.kicad_pcb     board, saved in native KiCad 10 format (via pcbnew)
     <name>.kicad_pro     project file (no DRC severities are overridden!)
     drc.rpt              FULL DRC report (nothing suppressed)
+    ORDER_INFO.txt       connector / hole / fab ordering details
     preview_front.svg / preview_back.svg
     gerbers/             gerber + drill files
     <name>_gerbers.zip   zipped gerbers, ready for a fab house
@@ -17,14 +18,19 @@ top; order ENIG).  Back layer carries column buses and all fan-out routing.
 Row escapes split left/right of the matrix for symmetry; silkscreen is on
 the back to conserve front space.
 
+Connectors and mounting holes are placed as real KiCad library footprints
+whenever the library provides a match (pin headers, JST XH/PH, mounting
+holes); otherwise a generated equivalent is used and a warning printed.
+
 Examples:
   python3 fsr_array_gen.py                                # default 8x8 PCB, THT header
   python3 fsr_array_gen.py -r 12 -c 12 --sensor-w 100 --sensor-h 100
   python3 fsr_array_gen.py --board-w 80 --board-h 90 --no-mounting-holes
-  python3 fsr_array_gen.py --style fpc --connector zif --connector-pitch 1.0
-  python3 fsr_array_gen.py --list-connectors FFC
+  python3 fsr_array_gen.py --style fpc --connector zif --tail-len 12
+  python3 fsr_array_gen.py --hole-size m2 --connector jst-xh
+  python3 fsr_array_gen.py --list-connectors "FFC 1x16 P1.0"
   python3 fsr_array_gen.py --connector lib --connector-footprint \
-      "Connector_FFC-FPC:TE_1-84952-6_1x16-1MP_P1.0mm_Horizontal"
+      "Connector_FFC-FPC:Molex_200528-0160_1x16-1MP_P1.00mm_Horizontal"
 """
 
 import argparse
@@ -44,9 +50,16 @@ STAG_R    = 0.8    # stagger between row escape verticals
 COL_STEP  = 0.7    # column fan level spacing (F.Cu band)
 ROW_STEP  = 0.8    # row fan level spacing (B.Cu band)
 BAND_GAP  = 0.9    # gap between array/col band/row band
-DROP_GAP  = 2.6    # row-fan deepest level to connector pad row
 VIA_SIZE, VIA_DRILL = 0.6, 0.3
-HOLE_D    = 3.2    # M3 NPTH mounting hole
+DEF_TRACE = 0.381  # 15 mil: finest geometry standard fabs do cheaply -> most
+                   # sensing copper per sensel without a cost/yield penalty
+
+HOLE_SIZES = {  # screw -> (hole dia mm, KiCad MountingHole footprint)
+    "m2":   (2.2, "MountingHole_2.2mm_M2"),
+    "m2.5": (2.7, "MountingHole_2.7mm_M2.5"),
+    "m3":   (3.2, "MountingHole_3.2mm_M3"),
+    "m4":   (4.3, "MountingHole_4.3mm_M4"),
+}
 
 
 def find_kicad():
@@ -76,18 +89,47 @@ def uid():
 
 
 # ---------------- connector catalogue ----------------
+# lib: template for the real KiCad library footprint ({n} = pin count).
+# order: lines for ORDER_INFO.txt ({n}, {pitch} substituted).
 CONNECTORS = {
-    # name: dict(kind, pitch, pad, drill, label)
-    "tht":    dict(kind="tht", pitch=2.54, pad=1.7, drill=1.0,
-                   label="Pin header 2.54 mm"),
-    "jst-xh": dict(kind="tht", pitch=2.50, pad=1.8, drill=1.0,
-                   label="JST XH (B{n}B-XH-A)"),
-    "jst-ph": dict(kind="tht", pitch=2.00, pad=1.3, drill=0.75,
-                   label="JST PH (B{n}B-PH-K)"),
-    "zif":    dict(kind="zif", pitch=1.00, pad=0.55, drill=0,
-                   label="FFC/FPC tail for ZIF socket (bottom contacts)"),
-    "lib":    dict(kind="lib", pitch=0, pad=0, drill=0,
-                   label="footprint from the KiCad library"),
+    "tht": dict(
+        kind="tht", pitch=2.54, pad=1.7, drill=1.0,
+        label="Pin header 2.54 mm",
+        lib="Connector_PinHeader_2.54mm:PinHeader_1x{n}_P2.54mm_Vertical",
+        order=["Generic male pin header, 1x{n}, 2.54 mm pitch, through-hole",
+               "  e.g. Wurth 61301611121 family or any breakaway header",
+               "  Mates with: standard 2.54 mm DuPont / jumper-wire housings"]),
+    "jst-xh": dict(
+        kind="tht", pitch=2.50, pad=1.8, drill=1.0,
+        label="JST XH (B{n}B-XH-A)",
+        lib="Connector_JST:JST_XH_B{n}B-XH-A_1x{n}_P2.50mm_Vertical",
+        order=["JST XH top-entry shrouded header, MPN: B{n}B-XH-A",
+               "  {n} pins, 2.50 mm pitch, through-hole",
+               "  Mates with: XHP-{n} housing + SXH-001T-P0.6 crimp contacts"]),
+    "jst-ph": dict(
+        kind="tht", pitch=2.00, pad=1.3, drill=0.75,
+        label="JST PH (B{n}B-PH-K)",
+        lib="Connector_JST:JST_PH_B{n}B-PH-K_1x{n}_P2.00mm_Vertical",
+        order=["JST PH top-entry header, MPN: B{n}B-PH-K",
+               "  {n} pins, 2.00 mm pitch, through-hole",
+               "  Mates with: PHR-{n} housing + SPH-002T-P0.5S crimp contacts"]),
+    "zif": dict(
+        kind="zif", pitch=1.00, pad=0.55, drill=0,
+        label="FFC/FPC tail for ZIF socket (bottom contacts)",
+        order=["FFC/FPC tail: {n} contacts, {pitch} mm pitch, "
+               "contacts on the BACK side",
+               "  Mates with: any {n}-position {pitch} mm bottom-contact "
+               "FFC/FPC ZIF socket",
+               "  e.g. Molex 200528 / TE 84952 family (1.0 mm), "
+               "Molex 505110 (0.5 mm)",
+               "  NOTE: add a stiffener under the tail so total thickness "
+               "is ~0.30 mm for ZIF grip"]),
+    "lib": dict(
+        kind="lib", pitch=0, pad=0, drill=0,
+        label="footprint from the KiCad library",
+        order=["Connector footprint: {fp}",
+               "  Order the part matching that footprint's MPN "
+               "(named in the footprint)"]),
 }
 
 
@@ -126,28 +168,57 @@ def kicad_py(code):
     return r.stdout
 
 
+def lib_exists(spec):
+    nick, name = spec.split(":", 1)
+    return (KICAD["fplib"] and
+            os.path.isfile(os.path.join(KICAD["fplib"], nick + ".pretty",
+                                        name + ".kicad_mod")))
+
+
 def dump_lib_footprint(spec):
-    """Return pad info for LIB:NAME from the KiCad library, via pcbnew."""
+    """Pad info + bbox for LIB:NAME at rotations 0/90/180/270, via pcbnew."""
     nick, name = spec.split(":", 1)
     libdir = os.path.join(KICAD["fplib"], nick + ".pretty")
     if not os.path.isdir(libdir):
         sys.exit(f"library '{nick}' not found in {KICAD['fplib']}")
     out = kicad_py(f"""
 import pcbnew, json
-fp = pcbnew.FootprintLoad({libdir!r}, {name!r})
-pads = []
-for p in fp.Pads():
-    pads.append(dict(num=p.GetNumber(),
-                     x=pcbnew.ToMM(p.GetPosition().x),
-                     y=pcbnew.ToMM(p.GetPosition().y),
-                     thru=p.GetAttribute() in (pcbnew.PAD_ATTRIB_PTH, pcbnew.PAD_ATTRIB_NPTH),
-                     front=p.IsOnLayer(pcbnew.F_Cu)))
-bb = fp.GetBoundingBox()
-print(json.dumps(dict(pads=pads, top=pcbnew.ToMM(bb.GetTop()),
-                      bottom=pcbnew.ToMM(bb.GetBottom()))))""")
+res = {{}}
+for rot in (0, 90, 180, 270):
+    fp = pcbnew.FootprintLoad({libdir!r}, {name!r})
+    fp.SetOrientationDegrees(rot)
+    pads = []
+    for p in fp.Pads():
+        pads.append(dict(num=p.GetNumber(),
+                         x=pcbnew.ToMM(p.GetPosition().x),
+                         y=pcbnew.ToMM(p.GetPosition().y),
+                         thru=p.GetAttribute() in (pcbnew.PAD_ATTRIB_PTH,
+                                                   pcbnew.PAD_ATTRIB_NPTH),
+                         front=p.IsOnLayer(pcbnew.F_Cu)))
+    bb = fp.GetBoundingBox(False)   # exclude text: ref/value inflate the box
+    res[str(rot)] = dict(pads=pads, top=pcbnew.ToMM(bb.GetTop()),
+                         bottom=pcbnew.ToMM(bb.GetBottom()),
+                         left=pcbnew.ToMM(bb.GetLeft()),
+                         right=pcbnew.ToMM(bb.GetRight()))
+print(json.dumps(res))""")
     if not out:
         sys.exit(f"could not load footprint {spec}")
     return json.loads(out)
+
+
+def pick_rotation(dumps, n_need):
+    """Choose the rotation where numbered pads form one left-to-right row."""
+    for rot in ("0", "90", "270", "180"):
+        pads = [p for p in dumps[rot]["pads"] if p["num"].isdigit()]
+        pads.sort(key=lambda p: int(p["num"]))
+        pads = pads[:n_need]
+        if len(pads) < n_need:
+            return None, None
+        ys = [p["y"] for p in pads]
+        xs = [p["x"] for p in pads]
+        if max(ys) - min(ys) < 0.05 and all(b > a for a, b in zip(xs, xs[1:])):
+            return int(rot), dumps[rot]
+    return None, None
 
 
 # ============================ generator ============================
@@ -156,6 +227,7 @@ class Gen:
         self.a = a
         self.segs, self.vias, self.extra, self.fps = [], [], [], []
         self.warnings = []
+        self.lib_adds = []          # footprints for pcbnew to place
         self.resolve_geometry()
 
     # ---------- geometry resolution ----------
@@ -163,43 +235,74 @@ class Gen:
         a = self.a
         R, C = a.rows, a.cols
         self.n_pads = R + C
+
+        # --- auto-optimal comb / sensel parameters (explicit values win) ---
+        a.trace = a.trace or DEF_TRACE
+        a.gap = a.gap or a.trace
+        sgap = a.sensel_gap or 1.0
+
+        # --- mounting holes ---
+        self.hole_d, self.hole_fp = HOLE_SIZES[a.hole_size]
+        self.holes = {"on": True, "off": False,
+                      "auto": a.style == "pcb"}[a.mounting_holes]
+        self.hole_half = self.hole_d / 2 + 1.5       # generated-footprint size
+        self.hole_lib = False
+        hole_spec = f"MountingHole:{self.hole_fp}"
+        if self.holes and lib_exists(hole_spec) and KICAD["python"]:
+            d = dump_lib_footprint(hole_spec)["0"]   # courtyard ring is wider
+            self.hole_half = max((d["right"] - d["left"]) / 2, self.hole_d / 2)
+            self.hole_lib = True
+        self.hole_off = max(self.hole_d / 2 + 2.9,   # hole center from corner
+                            self.hole_half + 0.7)
+
+        # --- connector: resolve a real library footprint when possible ---
         self.conn = dict(CONNECTORS[a.connector])
         if a.connector_pitch:
             self.conn["pitch"] = a.connector_pitch
+        self.lib_spec, self.lib_rot, self.libpads, self.libbox = None, 0, None, None
         if a.connector == "lib":
             if not a.connector_footprint:
                 sys.exit("--connector lib requires --connector-footprint LIB:NAME "
                          "(discover names with --list-connectors)")
-            dump = dump_lib_footprint(a.connector_footprint)
-            self.libbox = (dump["top"], dump["bottom"])
-            self.libpads = [p for p in dump["pads"] if p["num"].isdigit()]
-            self.libpads.sort(key=lambda p: int(p["num"]))
-            if len(self.libpads) < self.n_pads:
-                sys.exit(f"footprint has {len(self.libpads)} numbered pads, "
-                         f"need {self.n_pads}")
-            self.libpads = self.libpads[:self.n_pads]
+            self._load_lib_connector(a.connector_footprint)
+        elif self.conn.get("lib") and not a.connector_pitch:
+            spec = self.conn["lib"].format(n=self.n_pads)
+            if lib_exists(spec) and KICAD["python"]:
+                self._load_lib_connector(spec)
+            else:
+                self.warnings.append(
+                    f"{spec} not in KiCad library (or pcbnew unavailable); "
+                    "using a generated footprint instead")
+        elif a.connector_pitch and self.conn.get("lib"):
+            self.warnings.append(
+                "custom --connector-pitch given: using a generated footprint "
+                "instead of the KiCad library part")
 
-        self.holes = {"on": True, "off": False,
-                      "auto": a.style == "pcb"}[a.mounting_holes]
-
-        # side margins: row escapes split left/right (top half left, bottom right)
-        self.kL = (R + 1) // 2
+        # --- side margins: row escapes split left/right ---
+        # Fine-pitch (<0.9 mm) ZIF: vias can't fit between the drop columns,
+        # so columns must reach the B.Cu fingers without a layer change.
+        # Routing ALL rows out the left keeps the right half of B.Cu free of
+        # row copper, so column traces can stay on B.Cu end to end.
+        self.fine_zif = (a.connector == "zif" and self.conn["pitch"] < 0.9)
+        self.kL = R if self.fine_zif else (R + 1) // 2
         self.kR = R - self.kL
         side_need = EDGE_KEEP + VIA_OFF + max(self.kL - 1, 0) * STAG_R
-        self.top_margin = 8.5 if self.holes else MASK_M + 1.0
+        self.top_margin = (self.hole_off + self.hole_d / 2 + 2.4
+                           if self.holes else MASK_M + 1.0)
 
         # --- sensing area ---
-        sgap = a.sensel_gap
         if a.sensor_w and a.sensor_h:
+            if a.sensel_w or a.sensel_h or a.pitch or a.pitch_x or a.pitch_y:
+                self.warnings.append("sensor dims given: explicit sensel/pitch "
+                                     "values are ignored (derived instead)")
             self.pitch_x = (a.sensor_w + sgap) / C
             self.pitch_y = (a.sensor_h + sgap) / R
             self.sensel_w = self.pitch_x - sgap
             self.sensel_h = self.pitch_y - sgap
         elif a.board_w and a.board_h:
             sensor_w = a.board_w - 2 * side_need
-            # bottom margin depends only on x-geometry; estimate with worst case
             est_bottom = (MASK_M + BAND_GAP + C * COL_STEP + BAND_GAP
-                          + max(self.kL, self.kR) * ROW_STEP + DROP_GAP + 3.0)
+                          + max(self.kL, self.kR) * ROW_STEP + 2.6 + 3.0)
             sensor_h = a.board_h - self.top_margin - est_bottom
             if sensor_w <= 0 or sensor_h <= 0:
                 sys.exit("board too small for margins/connector")
@@ -208,10 +311,12 @@ class Gen:
             self.sensel_w = self.pitch_x - sgap
             self.sensel_h = self.pitch_y - sgap
         else:
-            self.sensel_w = a.sensel_w
-            self.sensel_h = a.sensel_h
-            self.pitch_x = a.pitch_x or a.pitch
-            self.pitch_y = a.pitch_y or a.pitch
+            px = a.pitch_x or a.pitch
+            py = a.pitch_y or a.pitch
+            self.sensel_w = a.sensel_w or (px - sgap if px else 8.0)
+            self.sensel_h = a.sensel_h or (py - sgap if py else 8.0)
+            self.pitch_x = px or self.sensel_w + sgap
+            self.pitch_y = py or self.sensel_h + sgap
         if self.sensel_w < 4 * (a.trace + a.gap):
             sys.exit(f"sensel width {self.sensel_w:.2f} mm too small for "
                      f"{a.trace}/{a.gap} mm combs")
@@ -229,7 +334,7 @@ class Gen:
         self.arr_b = self.arr_y + self.arr_h
 
         # --- connector pad positions (x) ---
-        if a.connector == "lib":
+        if self.libpads:
             xs = [p["x"] for p in self.libpads]
             ctr = (min(xs) + max(xs)) / 2
             self.pad_dx = [x - ctr for x in xs]
@@ -239,6 +344,17 @@ class Gen:
                            for i in range(self.n_pads)]
         self.conn_cx = self.board_w / 2
         self.pad_xs = [self.conn_cx + d for d in self.pad_dx]
+        diffs = [b - a_ for a_, b in zip(self.pad_xs, self.pad_xs[1:])]
+        self.conn_pitch_min = min(diffs) if diffs else 2.54
+        # narrow fan/drop traces when the connector is finer than the comb trace
+        self.drop_w = min(a.trace, max(self.conn_pitch_min / 2, 0.15))
+        # x-extent physically occupied by the connector (body, not just pads)
+        if self.libpads:
+            xs = [p["x"] for p in self.libpads]
+            ox = self.conn_cx - (min(xs) + max(xs)) / 2
+            self.conn_ext = (ox + self.libbox[2], ox + self.libbox[3])
+        else:
+            self.conn_ext = (min(self.pad_xs) - 2.0, max(self.pad_xs) + 2.0)
 
         # --- column fan grouping / bands ---
         self.col_left = [c for c in range(C)
@@ -252,25 +368,52 @@ class Gen:
         self.row_deep = self.row_top + max(row_levels - 1, 0) * ROW_STEP
 
         # --- connector y / board height ---
-        tail = {"tht": 3.0, "zif": 0.0, "lib": 4.0}[self.conn["kind"]]
-        if a.connector == "lib":
-            # keep the whole footprint (body, silk) inside the board edge
-            tail = max(tail, self.libbox[1] - self._lib_ymid + 1.0)
+        self.drop_gap = (max(2.6, self.hole_d / 2 + 1.15)
+                         if self.holes else 2.6)
         if a.connector == "zif":
-            self.tail_len = 6.0
+            self.tail_len = max(a.tail_len, 5.0)
+            if self.tail_len != a.tail_len:
+                self.warnings.append("tail length clamped to 5.0 mm minimum")
             self.tab_w = (self.n_pads - 1) * self.conn["pitch"] + 5.0
-        min_h = self.row_deep + DROP_GAP + tail
+            tail = 0.0
+            min_h = self.row_deep + 1.5      # body hugs the routing: no
+        else:                                # empty strip before the tail
+            tail = 3.0
+            if self.libbox is not None:      # keep whole footprint on board
+                tail = max(tail, self.libbox[1] - self._lib_ymid + 1.0)
+            min_h = self.row_deep + self.drop_gap + tail
         self.board_h = a.board_h or min_h
         if self.board_h < min_h - 1e-6:
             sys.exit(f"board height {self.board_h} mm too small; need "
                      f">= {min_h:.1f} mm")
-        self.pad_y = (self.board_h if a.connector == "zif"
-                      else self.board_h - tail)
-        if a.connector == "zif":
-            self.pad_y = self.board_h + self.tail_len - 2.0  # finger centers
+        self.pad_y = (self.board_h + self.tail_len - 2.0
+                      if a.connector == "zif" else self.board_h - tail)
+
+    def _load_lib_connector(self, spec):
+        dumps = dump_lib_footprint(spec)
+        rot, d = pick_rotation(dumps, self.n_pads)
+        if rot is None:
+            rot, d = 0, dumps["0"]
+            self.warnings.append(
+                f"{spec}: pads are not one ascending row at any rotation; "
+                "placed at 0 deg - REVIEW the connector area in KiCad")
+        self.lib_spec, self.lib_rot = spec, rot
+        self.libpads = [p for p in d["pads"] if p["num"].isdigit()]
+        self.libpads.sort(key=lambda p: int(p["num"]))
+        if len(self.libpads) < self.n_pads:
+            sys.exit(f"footprint {spec} has {len(self.libpads)} numbered "
+                     f"pads, need {self.n_pads}")
+        self.libpads = self.libpads[:self.n_pads]
+        self.libbox = (d["top"], d["bottom"], d["left"], d["right"])
+        self.conn["kind"] = "lib"
 
     def bus_x(self, c):
         return self.arr_x + c * self.pitch_x + self.sensel_w / 2
+
+    @property
+    def _lib_ymid(self):
+        ys = [p["y"] for p in self.libpads]
+        return (min(ys) + max(ys)) / 2
 
     # ---------- primitives ----------
     def seg(self, x1, y1, x2, y2, layer, net, w=None):
@@ -322,7 +465,11 @@ class Gen:
                         self.seg(xf, y_bot, xf, y_bot - finger_len, "F.Cu", self.cnet(c))
                 self.via(self.bus_x(c), y_bot, self.cnet(c))
 
-        # 2. column buses (B.Cu) + fan (F.Cu) ----------------------
+        # 2. column buses (B.Cu) + fan ----------------------------
+        # Normally the fan hops to F.Cu so it can cross the row band.  For
+        # fine-pitch ZIF all rows exited left, so the fan stays on B.Cu
+        # (nesting argument unchanged) and reaches the fingers via-free.
+        fan_layer = "B.Cu" if self.fine_zif else "F.Cu"
         for c in range(C):
             xb = self.bus_x(c)
             px = self.pad_xs[R + c]
@@ -332,9 +479,10 @@ class Gen:
                 right = [x for x in range(C) if x not in self.col_left]
                 y_fan = self.col_deep - (len(right) - 1 - right.index(c)) * COL_STEP
             self.seg(xb, self.arr_y + self.sensel_h, xb, y_fan, "B.Cu", self.cnet(c))
-            self.via(xb, y_fan, self.cnet(c))
-            self.seg(xb, y_fan, px, y_fan, "F.Cu", self.cnet(c))
-            self.drop_to_pad(px, y_fan, self.cnet(c), R + c, from_layer="F.Cu")
+            if not self.fine_zif:
+                self.via(xb, y_fan, self.cnet(c))
+            self.seg(xb, y_fan, px, y_fan, fan_layer, self.cnet(c), self.drop_w)
+            self.drop_to_pad(px, y_fan, self.cnet(c), R + c, from_layer=fan_layer)
 
         # 3. row escapes: top half left, bottom half right (B.Cu) --
         for r in range(R):
@@ -352,7 +500,7 @@ class Gen:
                 self.seg(self.arr_r, y_top, x_v, y_top, "F.Cu", self.rnet(r))
             self.via(x_v, y_top, self.rnet(r))
             self.seg(x_v, y_top, x_v, y_fan, "B.Cu", self.rnet(r))
-            self.seg(x_v, y_fan, px, y_fan, "B.Cu", self.rnet(r))
+            self.seg(x_v, y_fan, px, y_fan, "B.Cu", self.rnet(r), self.drop_w)
             self.drop_to_pad(px, y_fan, self.rnet(r), r, from_layer="B.Cu")
 
         # 4. connector --------------------------------------------
@@ -360,26 +508,40 @@ class Gen:
 
         # 5. mounting holes ---------------------------------------
         if self.holes:
-            pts = [(4.5, 4.5), (self.board_w - 4.5, 4.5)]
-            bx0 = min(self.pad_xs) - 6.0
-            bx1 = max(self.pad_xs) + 6.0
-            by = min(self.pad_y, self.board_h - 3.0)
-            if bx0 - HOLE_D / 2 - 1 > 0 and bx1 + HOLE_D / 2 + 1 < self.board_w:
-                pts += [(bx0, by), (bx1, by)]
-            else:
-                self.warnings.append("board too narrow for bottom mounting holes; "
-                                     "only top pair placed")
-            for i, (mx, my) in enumerate(pts):
-                self.fps.append(
-                    f'  (footprint "FSR:MountingHole_M3" (layer "F.Cu") (uuid "{uid()}") '
-                    f'(at {mx:.3f} {my:.3f})\n'
-                    f'    (attr exclude_from_pos_files exclude_from_bom)\n'
-                    f'    (fp_text reference "H{i + 1}" (at 0 -3) (layer "F.Fab") (uuid "{uid()}")\n'
-                    f'      (effects (font (size 1 1) (thickness 0.15))))\n'
-                    f'    (fp_text value "M3" (at 0 3) (layer "F.Fab") (uuid "{uid()}")\n'
-                    f'      (effects (font (size 1 1) (thickness 0.15))))\n'
-                    f'    (pad "" np_thru_hole circle (at 0 0) (size {HOLE_D} {HOLE_D}) '
-                    f'(drill {HOLE_D}) (layers "*.Cu" "*.Mask") (uuid "{uid()}"))\n  )')
+            off = self.hole_off
+            pts = [(off, off), (self.board_w - off, off)]
+            if self.a.connector != "zif":       # bottom pair flanks connector
+                bx0 = self.conn_ext[0] - (self.hole_half + 0.6)
+                bx1 = self.conn_ext[1] + (self.hole_half + 0.6)
+                by = min(self.pad_y, self.board_h - self.hole_d / 2 - 1.4)
+                if bx0 - self.hole_half - 0.5 > 0 and \
+                   bx1 + self.hole_half + 0.5 < self.board_w:
+                    pts += [(bx0, by), (bx1, by)]
+                else:
+                    self.warnings.append("board too narrow for bottom mounting "
+                                         "holes; only top pair placed")
+            self.hole_pts = pts
+            spec = f"MountingHole:{self.hole_fp}"
+            if self.hole_lib:
+                for i, (mx, my) in enumerate(pts):
+                    self.lib_adds.append(dict(spec=spec, x=mx, y=my, rot=0,
+                                              ref=f"H{i + 1}", nets={},
+                                              hide_ref=True))
+            else:                                # generated NPTH fallback
+                for i, (mx, my) in enumerate(pts):
+                    self.fps.append(
+                        f'  (footprint "FSR:MountingHole" (layer "F.Cu") '
+                        f'(uuid "{uid()}") (at {mx:.3f} {my:.3f})\n'
+                        f'    (attr exclude_from_pos_files exclude_from_bom)\n'
+                        f'    (fp_text reference "H{i + 1}" (at 0 -3) (layer "F.Fab") '
+                        f'(uuid "{uid()}")\n'
+                        f'      (effects (font (size 1 1) (thickness 0.15))))\n'
+                        f'    (fp_text value "{self.a.hole_size.upper()}" (at 0 3) '
+                        f'(layer "F.Fab") (uuid "{uid()}")\n'
+                        f'      (effects (font (size 1 1) (thickness 0.15))))\n'
+                        f'    (pad "" np_thru_hole circle (at 0 0) '
+                        f'(size {self.hole_d} {self.hole_d}) (drill {self.hole_d}) '
+                        f'(layers "*.Cu" "*.Mask") (uuid "{uid()}"))\n  )')
 
         # 6. mask opening, outline, back silk ---------------------
         mx0, my0 = self.arr_x - MASK_M, self.arr_y - MASK_M
@@ -394,7 +556,8 @@ class Gen:
         title = (f"FSR {R}x{C} {a.trace * 1000 / 25.4:.0f}/"
                  f"{a.gap * 1000 / 25.4:.0f} mil {a.style.upper()} ENIG")
         room = self.arr_y - MASK_M                    # space above mask opening
-        avail_w = self.board_w - 2 * (6.6 if self.holes else 1.5)
+        avail_w = self.board_w - 2 * ((self.hole_off + self.hole_d / 2 + 0.5)
+                                      if self.holes else 1.5)
         size = min(1.4, room - 1.0, avail_w / (len(title) * 0.95))
         if room >= 2.0 and size >= 0.8:
             self.text(title, self.board_w / 2, room / 2, "B.SilkS", size)
@@ -410,39 +573,61 @@ class Gen:
     def drop_to_pad(self, px, y_fan, net, pad_idx, from_layer):
         """Route from a fan level down into connector pad pad_idx."""
         kind = self.conn["kind"]
+        w = self.drop_w
         if kind == "tht":
-            self.seg(px, y_fan, px, self.pad_y, from_layer, net)
+            self.seg(px, y_fan, px, self.pad_y, from_layer, net, w)
         elif kind == "zif":
             # fingers are on B.Cu; F.Cu arrivals (columns) via just inside tab
-            if from_layer == "F.Cu":
-                yv = self.board_h + 1.2
-                self.seg(px, y_fan, px, yv, "F.Cu", net)
-                self.via(px, yv, net)
-                self.seg(px, yv, px, self.pad_y, "B.Cu", net)
+            if from_layer != "F.Cu":                     # already on B.Cu
+                self.seg(px, y_fan, px, self.pad_y, from_layer, net, w)
             else:
-                self.seg(px, y_fan, px, self.pad_y, from_layer, net)
+                yv = self.board_h + (1.2 if pad_idx % 2 == 0 else 2.2)
+                self.seg(px, y_fan, px, yv, "F.Cu", net, w)
+                self.via(px, yv, net)
+                self.seg(px, yv, px, self.pad_y, "B.Cu", net, w)
         else:                                          # lib footprint
             p = self.libpads[pad_idx]
             pad_y = self.pad_y + p["y"] - self._lib_ymid
-            if p["thru"]:
-                self.seg(px, y_fan, px, pad_y, from_layer, net)
-            elif p["front"] == (from_layer == "F.Cu"):
-                self.seg(px, y_fan, px, pad_y, from_layer, net)
+            if p["thru"] or p["front"] == (from_layer == "F.Cu"):
+                self.seg(px, y_fan, px, pad_y, from_layer, net, w)
             else:
                 # layer change: via must sit BELOW the row fan band (clearance!)
                 yv = (max(self.row_deep + 0.9, pad_y - 2.0)
                       + (0.8 if pad_idx % 2 else 0))            # stagger vias
-                self.seg(px, y_fan, px, yv, from_layer, net)
+                self.seg(px, y_fan, px, yv, from_layer, net, w)
                 self.via(px, yv, net)
                 other = "F.Cu" if p["front"] else "B.Cu"
-                self.seg(px, yv, px, pad_y, other, net)
+                self.seg(px, yv, px, pad_y, other, net, w)
+
+    def pad_names(self):
+        return ([f"ROW{r + 1}" for r in range(self.a.rows)]
+                + [f"COL{c + 1}" for c in range(self.a.cols)])
+
+    def pin_labels(self):
+        """R1..Rn / C1..Cn silk labels near the connector, on the back."""
+        if self.conn_pitch_min < 1.8:        # too fine to label per pin
+            return
+        ly = self.pad_y + 2.6
+        if ly > self.board_h - 0.9:
+            ly = self.pad_y - 2.6
+        R = self.a.rows
+        for i in range(self.n_pads):
+            lbl = f"R{i + 1}" if i < R else f"C{i - R + 1}"
+            self.text(lbl, self.pad_xs[i], ly, "B.SilkS", 0.8)
 
     def make_connector(self):
-        a, R = self.a, self.a.rows
-        names = ([f"ROW{r + 1}" for r in range(R)]
-                 + [f"COL{c + 1}" for c in range(self.a.cols)])
+        a = self.a
+        names = self.pad_names()
         kind = self.conn["kind"]
-        if kind == "tht":
+        if kind == "lib":
+            xs = [p["x"] for p in self.libpads]
+            cx = (min(xs) + max(xs)) / 2
+            self.lib_adds.append(dict(
+                spec=self.lib_spec, x=self.conn_cx - cx,
+                y=self.pad_y - self._lib_ymid, rot=self.lib_rot, ref="J1",
+                nets={p["num"]: names[i] for i, p in enumerate(self.libpads)}))
+            self.pin_labels()
+        elif kind == "tht":
             pads = []
             for i in range(self.n_pads):
                 shape = "rect" if i == 0 else "circle"
@@ -450,8 +635,6 @@ class Gen:
                     f'    (pad "{i + 1}" thru_hole {shape} (at {self.pad_dx[i] - self.pad_dx[0]:.3f} 0) '
                     f'(size {self.conn["pad"]} {self.conn["pad"]}) (drill {self.conn["drill"]}) '
                     f'(layers "*.Cu" "*.Mask") (net {i + 1} "{names[i]}") (uuid "{uid()}"))')
-                lbl = f"R{i + 1}" if i < R else f"C{i - R + 1}"
-                self.text(lbl, self.pad_xs[i], self.pad_y + 2.4, "B.SilkS", 0.8)
             self.fps.append(
                 f'  (footprint "FSR:{a.connector}_1x{self.n_pads}" (layer "F.Cu") '
                 f'(uuid "{uid()}") (at {self.pad_xs[0]:.3f} {self.pad_y:.3f})\n'
@@ -463,6 +646,7 @@ class Gen:
                 f'(at {-self.pad_dx[0]:.3f} 2.6) (layer "B.Fab") (uuid "{uid()}")\n'
                 f'      (effects (font (size 1 1) (thickness 0.15)) (justify mirror)))\n'
                 + "\n".join(pads) + "\n  )")
+            self.pin_labels()
         elif kind == "zif":
             pw = self.conn["pitch"] * 0.55
             pads = []
@@ -482,9 +666,6 @@ class Gen:
                 f'(at {-self.pad_dx[0]:.3f} -5.2) (layer "B.Fab") (uuid "{uid()}")\n'
                 f'      (effects (font (size 1 1) (thickness 0.15)) (justify mirror)))\n'
                 + "\n".join(pads) + "\n  )")
-            self.text(f"stiffener under tail ->{0.3 - (0.13 if self.a.style == 'fpc' else 1.6):+.2f}mm",
-                      self.conn_cx, self.board_h - 2.0, "B.SilkS", 0.8)
-        # 'lib' footprint is added by pcbnew in finalize(); nothing here.
 
     def make_outline(self):
         w, h = self.board_w, self.board_h
@@ -537,39 +718,68 @@ class Gen:
             + "\n".join(self.segs) + "\n"
             + "\n".join(self.vias) + "\n)\n")
 
-    @property
-    def _lib_ymid(self):
-        ys = [p["y"] for p in self.libpads]
-        return (min(ys) + max(ys)) / 2
+    def order_info(self):
+        a = self.a
+        n = self.n_pads
+        L = [f"FSR {a.rows}x{a.cols} sensing array - ordering / assembly info",
+             "=" * 56, "",
+             f"Board:      {self.board_w:.1f} x {self.board_h:.1f} mm"
+             + (f" + {self.tail_len:.1f} mm tail" if a.connector == "zif" else "")
+             + f", 2-layer, {'0.13 mm polyimide flex' if a.style == 'fpc' else '1.6 mm FR-4'}",
+             "Finish:     ENIG (REQUIRED - the sensing copper stays exposed;",
+             "            HASL/bare copper will oxidize and drift)",
+             f"Sensing:    {self.arr_w:.1f} x {self.arr_h:.1f} mm window, "
+             f"{a.rows}x{a.cols} sensels @ {self.pitch_x:.2f} x {self.pitch_y:.2f} mm pitch",
+             f"Combs:      {a.trace:.3f} mm trace / {a.gap:.3f} mm gap "
+             f"({a.trace * 1000 / 25.4:.0f}/{a.gap * 1000 / 25.4:.0f} mil), "
+             f"{self.n_fingers} fingers per sensel", "",
+             f"Connector J1 ({n} positions: pins 1-{a.rows} = rows, "
+             f"{a.rows + 1}-{n} = columns):"]
+        for line in self.conn.get("order", []):
+            L.append("  " + line.format(n=n, pitch=self.conn["pitch"],
+                                        fp=self.lib_spec or ""))
+        if self.lib_spec:
+            L.append(f"  KiCad footprint used: {self.lib_spec}"
+                     + (f" (rotated {self.lib_rot} deg)" if self.lib_rot else ""))
+        L.append("")
+        if self.holes:
+            d = self.hole_d
+            L.append(f"Mounting:   {len(self.hole_pts)}x {a.hole_size.upper()} "
+                     f"screws ({d} mm holes, KiCad {self.hole_fp})")
+        else:
+            L.append("Mounting:   none (adhesive / clamped assembly)")
+        L += ["", "Assembly stack-up:",
+              "  1. this PCB, sensing window facing up",
+              "  2. Velostat / Linqstat piezoresistive film covering the window",
+              "  3. top pressure layer (foam/fabric/plate) - do NOT glue over",
+              "     the comb area; tape the film edges outside the window"]
+        return "\n".join(L)
 
 
 # ============================ pipeline ============================
 def finalize_with_pcbnew(gen, pcb_path):
-    """Round-trip through pcbnew: adds lib connector if any, saves native v10."""
-    a = gen.a
-    fp_code = ""
-    if a.connector == "lib":
-        nick, name = a.connector_footprint.split(":", 1)
-        libdir = os.path.join(KICAD["fplib"], nick + ".pretty")
-        xs = [p["x"] for p in gen.libpads]
-        cx = (min(xs) + max(xs)) / 2
-        netmap = {p["num"]: (f"ROW{i + 1}" if i < a.rows else f"COL{i - a.rows + 1}")
-                  for i, p in enumerate(gen.libpads)}
-        fp_code = f"""
-fp = pcbnew.FootprintLoad({libdir!r}, {name!r})
-fp.SetPosition(pcbnew.VECTOR2I(pcbnew.FromMM({gen.conn_cx - cx!r}),
-                               pcbnew.FromMM({gen.pad_y - gen._lib_ymid!r})))
-fp.Reference().SetText("J1")
-board.Add(fp)
-nm = {netmap!r}
-for p in fp.Pads():
-    if p.GetNumber() in nm:
-        p.SetNet(board.FindNet(nm[p.GetNumber()]))
-"""
+    """Round-trip through pcbnew: adds library footprints, saves native v10."""
+    adds = []
+    for it in gen.lib_adds:
+        nick, name = it["spec"].split(":", 1)
+        adds.append(dict(lib=os.path.join(KICAD["fplib"], nick + ".pretty"),
+                         name=name, x=it["x"], y=it["y"], rot=it["rot"],
+                         ref=it["ref"], nets=it["nets"],
+                         hide_ref=it.get("hide_ref", False)))
     out = kicad_py(f"""
-import pcbnew
+import pcbnew, json
 board = pcbnew.LoadBoard({pcb_path!r})
-{fp_code}
+for it in json.loads({json.dumps(adds)!r}):
+    fp = pcbnew.FootprintLoad(it["lib"], it["name"])
+    fp.SetOrientationDegrees(it["rot"])
+    fp.SetPosition(pcbnew.VECTOR2I(pcbnew.FromMM(it["x"]), pcbnew.FromMM(it["y"])))
+    fp.Reference().SetText(it["ref"])
+    if it["hide_ref"]:
+        fp.Reference().SetVisible(False)
+    board.Add(fp)
+    for p in fp.Pads():
+        if p.GetNumber() in it["nets"]:
+            p.SetNet(board.FindNet(it["nets"][p.GetNumber()]))
 pcbnew.SaveBoard({pcb_path!r}, board)
 print("saved", pcbnew.GetBuildVersion())""")
     return out is not None
@@ -639,15 +849,15 @@ def main():
     g = ap.add_argument_group("matrix")
     g.add_argument("-r", "--rows", type=int, default=8)
     g.add_argument("-c", "--cols", type=int, default=8)
-    g.add_argument("--trace", type=float, default=0.381, help="finger width mm")
-    g.add_argument("--gap", type=float, default=0.381, help="finger gap mm")
-    g.add_argument("--sensel-w", type=float, default=8.0)
-    g.add_argument("--sensel-h", type=float, default=8.0)
-    g.add_argument("--pitch", type=float, default=9.0, help="sensel pitch mm (both axes)")
+    g.add_argument("--trace", type=float, help="finger width mm (default 0.381 = 15 mil)")
+    g.add_argument("--gap", type=float, help="finger gap mm (default = trace)")
+    g.add_argument("--sensel-w", type=float, help="active comb width mm (default 8 or derived)")
+    g.add_argument("--sensel-h", type=float, help="active comb height mm")
+    g.add_argument("--pitch", type=float, help="sensel pitch mm, both axes (default 9 or derived)")
     g.add_argument("--pitch-x", type=float)
     g.add_argument("--pitch-y", type=float)
-    g.add_argument("--sensel-gap", type=float, default=1.0,
-                   help="spacing between sensels in auto-fit modes")
+    g.add_argument("--sensel-gap", type=float,
+                   help="spacing between sensels in auto-fit modes (default 1.0)")
     d = ap.add_argument_group("dimensions (mm) — auto-fit")
     d.add_argument("--sensor-w", type=float,
                    help="total sensing width (cols direction); derives pitch/sensel")
@@ -660,10 +870,13 @@ def main():
     o.add_argument("--connector", choices=list(CONNECTORS), default="tht")
     o.add_argument("--connector-pitch", type=float)
     o.add_argument("--connector-footprint", metavar="LIB:NAME")
+    o.add_argument("--tail-len", type=float, default=6.0,
+                   help="ZIF tail length mm (default 6, min 5)")
     o.add_argument("--list-connectors", metavar="PATTERN", nargs="?", const="")
     o.add_argument("--mounting-holes", choices=["auto", "on", "off"], default="auto")
     o.add_argument("--no-mounting-holes", dest="mounting_holes",
                    action="store_const", const="off")
+    o.add_argument("--hole-size", choices=list(HOLE_SIZES), default="m3")
     o.add_argument("--name", help="project name (default fsr_RxC)")
     o.add_argument("--outdir", default=".", help="parent directory for project folder")
     a = ap.parse_args()
@@ -685,12 +898,13 @@ def main():
         json.dump({"meta": {"filename": f"{name}.kicad_pro", "version": 3}}, f, indent=2)
 
     if finalize_with_pcbnew(gen, pcb):
-        print(f"Saved {pcb} in native KiCad {KICAD['cli'] and '10' or ''} format")
+        print(f"Saved {pcb} in native KiCad 10 format")
     else:
         print(f"Saved {pcb} (KiCad 8 text format; opens fine in KiCad 10)")
 
-    print(f"  board  : {gen.board_w:.1f} x {gen.board_h:.1f} mm   "
-          f"style={a.style}  connector={a.connector}")
+    print(f"  board  : {gen.board_w:.1f} x {gen.board_h:.1f} mm"
+          + (f" + {gen.tail_len:.1f} mm tail" if a.connector == "zif" else "")
+          + f"   style={a.style}  connector={a.connector}")
     print(f"  sensing: {gen.arr_w:.1f} x {gen.arr_h:.1f} mm  "
           f"({a.rows}x{a.cols} sensels, {gen.pitch_x:.2f}x{gen.pitch_y:.2f} mm pitch, "
           f"sensel {gen.sensel_w:.2f}x{gen.sensel_h:.2f} mm)")
@@ -698,6 +912,11 @@ def main():
           f"{a.trace}/{a.gap} mm trace/gap")
     for w in gen.warnings:
         print(f"  WARNING: {w}")
+
+    info = gen.order_info()
+    with open(os.path.join(folder, "ORDER_INFO.txt"), "w") as f:
+        f.write(info + "\n")
+    print("\n" + info)
 
     run_drc(pcb, os.path.join(folder, "drc.rpt"))
     export_outputs(folder, name)

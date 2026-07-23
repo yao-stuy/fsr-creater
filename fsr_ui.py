@@ -28,7 +28,8 @@ FLAGS = {
     "pitch_x": "--pitch-x", "pitch_y": "--pitch-y", "sensel_gap": "--sensel-gap",
     "sensor_w": "--sensor-w", "sensor_h": "--sensor-h",
     "board_w": "--board-w", "board_h": "--board-h",
-    "connector_pitch": "--connector-pitch", "name": "--name",
+    "connector_pitch": "--connector-pitch", "tail_len": "--tail-len",
+    "name": "--name",
 }
 
 PAGE = """<!doctype html>
@@ -126,6 +127,11 @@ a.dl { color:var(--acc); }
       <div class="f"><label>Mounting holes</label>
         <select name="mounting_holes"><option value="auto">auto</option>
         <option value="on">on</option><option value="off">off</option></select></div>
+      <div class="f"><label>Hole size</label>
+        <select name="hole_size"><option value="m2">M2</option>
+        <option value="m2.5">M2.5</option>
+        <option value="m3" selected>M3</option>
+        <option value="m4">M4</option></select></div>
     </div>
     <div class="row">
       <div class="f"><label>Connector</label>
@@ -138,6 +144,8 @@ a.dl { color:var(--acc); }
         </select></div>
       <div class="f"><label>Conn. pitch mm (opt)</label>
         <input name="connector_pitch" placeholder="default"></div>
+      <div class="f"><label>ZIF tail len mm</label>
+        <input name="tail_len" placeholder="6.0"></div>
     </div>
     <div id="libbox">
       <div class="row"><div class="f">
@@ -237,7 +245,8 @@ def run_gen(data):
             args += [flag, v]
     args += ["--style", data.get("style", "pcb"),
              "--connector", data.get("connector", "tht"),
-             "--mounting-holes", data.get("mounting_holes", "auto")]
+             "--mounting-holes", data.get("mounting_holes", "auto"),
+             "--hole-size", data.get("hole_size", "m3")]
     if data.get("connector") == "lib" and data.get("connector_footprint"):
         args += ["--connector-footprint", data["connector_footprint"]]
     r = subprocess.run(args, capture_output=True, text=True, cwd=HERE, timeout=300)
