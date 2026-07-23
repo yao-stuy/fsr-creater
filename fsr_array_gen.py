@@ -173,8 +173,13 @@ def lib_exists(spec):
                                         name + ".kicad_mod")))
 
 
+_DUMP_CACHE = {}
+
+
 def dump_lib_footprint(spec):
     """Pad info + bbox for LIB:NAME at rotations 0/90/180/270, via pcbnew."""
+    if spec in _DUMP_CACHE:
+        return _DUMP_CACHE[spec]
     nick, name = spec.split(":", 1)
     libdir = os.path.join(KICAD["fplib"], nick + ".pretty")
     if not os.path.isdir(libdir):
@@ -201,7 +206,8 @@ for rot in (0, 90, 180, 270):
 print(json.dumps(res))""")
     if not out:
         sys.exit(f"could not load footprint {spec}")
-    return json.loads(out)
+    _DUMP_CACHE[spec] = json.loads(out)
+    return _DUMP_CACHE[spec]
 
 
 def pick_rotation(dumps, n_need):
@@ -224,15 +230,16 @@ class Gen:
     def __init__(self, a):
         self.a = a
         self.segs, self.vias, self.extra, self.fps = [], [], [], []
-        self.warnings = []
         self.lib_adds = []          # KiCad-library footprints for pcbnew
         self.gen_lib = {}           # generated footprints -> project FSR.pretty
+        self._slack, self._iter = 0.0, 0    # board-dims auto-fit refinement
         self.resolve_geometry()
 
     # ---------- geometry resolution ----------
     def resolve_geometry(self):
         a = self.a
         R, C = a.rows, a.cols
+        self.warnings = []          # reset: this method may run iteratively
         # fixed mode: always a 16-pin connector (pins 1-8 rows, 9-16 cols,
         # unused positions NC) so one cable/readout fits any array size
         if a.fixed_pins and (R > 8 or C > 8):
@@ -307,7 +314,9 @@ class Gen:
             sensor_w = a.board_w - 2 * side_need
             est_bottom = (MASK_M + BAND_GAP + C * COL_STEP + BAND_GAP
                           + max(self.kL, self.kR) * ROW_STEP + 2.6 + 3.0)
-            sensor_h = a.board_h - self.top_margin - est_bottom
+            # _slack: measured leftover from the previous pass (see below),
+            # so the sensing area grows/shrinks until the body is tight
+            sensor_h = a.board_h - self.top_margin - est_bottom + self._slack
             if sensor_w <= 0 or sensor_h <= 0:
                 sys.exit("board too small for margins/connector")
             self.pitch_x = (sensor_w + sgap) / C
@@ -431,6 +440,14 @@ class Gen:
                 tail = max(tail, self.libbox[1] - self._lib_ymid + 1.0)
             min_h = self.row_deep + self.drop_gap + tail
         self.board_h = a.board_h or min_h
+        # board-dims auto-fit: the sensor height came from an estimate;
+        # measure the real leftover and re-derive until the body bottom
+        # hugs the routing (converges in 1-2 passes)
+        if (a.board_w and a.board_h and not (a.sensor_w and a.sensor_h)
+                and self._iter < 5 and abs(self.board_h - min_h) > 0.05):
+            self._slack += self.board_h - min_h
+            self._iter += 1
+            return self.resolve_geometry()
         if self.board_h < min_h - 1e-6:
             sys.exit(f"board height {self.board_h} mm too small; need "
                      f">= {min_h:.1f} mm")
