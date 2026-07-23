@@ -317,6 +317,19 @@ class Gen:
         self.conn = dict(CONNECTORS[a.connector])
         if a.connector_pitch:
             self.conn["pitch"] = a.connector_pitch
+            # scale pad/drill to stay reasonable at the requested pitch
+            pt = a.connector_pitch
+            if (self.conn["kind"] == "tht" and a.connector_mount != "smd"
+                    and self.conn["pad"] > pt - 0.32):
+                pad = round(pt - 0.32, 2)
+                drill = round(min(self.conn["drill"], pad - 0.3, pt / 2), 2)
+                if a.connector_mount != "smd" and (pad < 0.55 or drill < 0.3):
+                    sys.exit(f"{pt} mm pitch is too fine for a through-hole "
+                             "connector — use --connector-mount smd")
+                self.warnings.append(
+                    f"pad/drill auto-scaled to {pad}/{drill} mm for "
+                    f"{pt} mm pitch")
+                self.conn["pad"], self.conn["drill"] = pad, drill
         # contacts: for zif = which face carries fingers; for everything
         # else = which side of the board the connector mounts on
         self.conn_side = a.contacts
@@ -332,7 +345,9 @@ class Gen:
                 sys.exit("--connector lib requires --connector-footprint LIB:NAME "
                          "(discover names with --list-connectors)")
             self._load_lib_connector(a.connector_footprint, flip)
-        elif a.connector != "zif" and not a.connector_pitch:
+        elif (a.connector != "zif" and not a.connector_pitch
+              and not (self.c_rows > 1
+                       and a.connector_numbering == "straight")):
             key = (("lib2" if self.c_rows == 2 else "lib")
                    + ("_smd" if a.connector_mount == "smd" else "")
                    + ("_h" if a.connector_angle == "horizontal" else ""))
@@ -349,10 +364,14 @@ class Gen:
                     "using a generated footprint")
                 if a.connector_mount == "smd":
                     self.conn["kind"] = "smd"
-        elif a.connector_pitch and a.connector != "zif":
-            self.warnings.append(
-                "custom --connector-pitch given: using a generated footprint "
-                "instead of the KiCad library part")
+        elif a.connector != "zif":
+            if a.connector_pitch:
+                self.warnings.append(
+                    "custom --connector-pitch given: using a generated "
+                    "footprint instead of the KiCad library part")
+            else:   # straight-numbered dual row: KiCad's headers are zigzag
+                self.warnings.append("straight-numbered dual-row: using a "
+                                     "generated footprint")
             if a.connector_mount == "smd":
                 self.conn["kind"] = "smd"
 
@@ -428,6 +447,11 @@ class Gen:
         if self.libpads:
             cxs = [q["x"] for q in self.libpads]
             cys = [q["y"] for q in self.libpads]
+        elif a.connector_numbering == "straight" and self.c_rows > 1:
+            # straight: pins 1..n/2 across the near row, rest across the far
+            cols = self.n_pads // self.c_rows
+            cxs = [(i % cols) * pt for i in range(self.n_pads)]
+            cys = [(i // cols) * pt for i in range(self.n_pads)]
         else:  # generated: zigzag numbering, pin 1+2 share the first column
             cxs = [(i // self.c_rows) * pt for i in range(self.n_pads)]
             cys = [(i % self.c_rows) * pt for i in range(self.n_pads)]
@@ -437,33 +461,46 @@ class Gen:
         self.pad_cy = [y - ymid for y in cys]        # rel to pad-field mid
         if self.c_rows == 2:
             # far-row pads are reached by dropping between the columns; the
-            # offset goes toward the pad's side of its pair so the drop-x
-            # sequence stays strictly ascending (the fan nesting needs it)
+            # offset direction keeps each net group's drop-x sequence
+            # strictly ascending (the fan nesting needs it): shift toward
+            # the far pad's side of its column partner in numbering order
             uniq = sorted({round(x, 3) for x in cxs})
             self.colp2 = uniq[1] - uniq[0] if len(uniq) > 1 else pt
             self.pad_dx = list(self.pad_cdx)
-            for k in range(self.n_pads // 2):
-                i0, i1 = 2 * k, 2 * k + 1
-                if self.pad_cy[i0] > self.pad_cy[i1]:   # far pad first
-                    self.pad_dx[i0] -= self.colp2 / 2
-                else:                                   # far pad second
-                    self.pad_dx[i1] += self.colp2 / 2
+            far = max(self.pad_cy)
+            for i in range(self.n_pads):
+                if abs(self.pad_cy[i] - far) > 0.05:
+                    continue                            # near row: straight
+                j = next(k for k in range(self.n_pads) if k != i
+                         and abs(self.pad_cdx[k] - self.pad_cdx[i]) < 0.05)
+                self.pad_dx[i] += -self.colp2 / 2 if i < j else self.colp2 / 2
         else:
             self.pad_dx = list(self.pad_cdx)
         self.conn_cx = self.board_w / 2
         self.pad_xs = [self.conn_cx + d for d in self.pad_dx]    # fan targets
         self.pad_cxs = [self.conn_cx + d for d in self.pad_cdx]  # pad centers
-        diffs = [b - a_ for a_, b in zip(self.pad_xs, self.pad_xs[1:])]
+        sp = sorted(self.pad_xs)
+        diffs = [b - a_ for a_, b in zip(sp, sp[1:]) if b - a_ > 0.05]
         self.conn_pitch_min = min(diffs) if diffs else 2.54
         # narrow fan/drop traces when the connector is finer than the comb trace
-        self.drop_w = min(a.trace, max(self.conn_pitch_min / 2, 0.15))
+        self.drop_w = min(a.trace, max(self.conn_pitch_min / 2, 0.2))
         if self.c_rows == 2:
-            self.drop_w = min(self.drop_w, 0.3)
-            pad_sz = 1.7 if self.libpads else self.conn["pad"]
-            clear = self.colp2 / 2 - pad_sz / 2 - self.drop_w / 2
-            if clear < 0.2:
-                sys.exit(f"2-row layout not routable: {clear:.2f} mm between "
-                         f"pads at {self.colp2} mm column pitch")
+            if self.libpads:
+                pad_sz = 1.7                     # library 2xNN pin header
+            elif self.conn["kind"] == "smd":
+                pad_sz = min(self.conn["pitch"] * 0.5, 1.2)
+            else:
+                pad_sz = self.conn["pad"]
+            for wc in (0.3, 0.25, 0.2):     # widest that clears the pads
+                if self.colp2 / 2 - pad_sz / 2 - wc / 2 >= 0.199:
+                    self.drop_w = min(self.drop_w, wc)
+                    break
+            else:
+                sys.exit(f"2-row layout not routable: {pad_sz} mm pads at "
+                         f"{self.colp2} mm column pitch leave no room to "
+                         "reach the far row"
+                         + ("" if a.connector_mount == "smd" else
+                            " — try --connector-mount smd"))
         # x-extent physically occupied by the connector (body, not just pads)
         if self.libpads:
             ox = self.conn_cx - ctr
@@ -485,6 +522,11 @@ class Gen:
         # --- connector y / board height ---
         self.drop_gap = (max(2.6, self.hole_d / 2 + 1.15)
                          if self.holes else 2.6)
+        if self.conn["kind"] == "smd" and self.c_rows == 2:
+            # staggered layer-change vias must clear the whole pad field
+            ph = round(self.conn["pitch"] - 0.5, 2)
+            self.drop_gap = max(self.drop_gap,
+                                2.2 + ph / 2 - min(self.pad_cy))
         self.edge_rule = None
         if a.connector == "zif":
             self.tail_len = max(a.tail_len, 5.0)
@@ -1088,10 +1130,12 @@ class Gen:
                      + ("" if a.connector_mount == "smd" else
                         "; through-hole: insert from that side"))
             if self.c_rows > 1:
-                L.append(f"  {self.c_rows} rows x "
-                         f"{n // self.c_rows} pins, zigzag numbering "
-                         "(pins 1+2 share the first column, odd = one row, "
-                         "even = the other)")
+                L.append(f"  {self.c_rows} rows x {n // self.c_rows} pins, "
+                         + ("zigzag numbering (pins 1+2 share the first "
+                            "column, odd/even split the rows)"
+                            if a.connector_numbering == "zigzag" else
+                            f"straight numbering (pins 1-{n // 2} across one "
+                            f"row, {n // 2 + 1}-{n} across the other)"))
             if getattr(self, "overhang", 0) > 0.05:
                 L.append(f"  Body/entry overhangs the board edge by "
                          f"{self.overhang:.1f} mm - only the solder pads "
@@ -1289,8 +1333,14 @@ def main():
                         "(side entry) connector (non-ZIF; default vertical)")
     o.add_argument("--connector-rows", type=int, choices=[1, 2], default=1,
                    help="connector rows (non-ZIF; default 1): 2 splits the "
-                        "pins into two equal rows (e.g. 2x8 for 16 pins, "
-                        "zigzag numbering); pin count must divide evenly")
+                        "pins into two equal rows (e.g. 2x8 for 16 pins); "
+                        "pin count must divide evenly")
+    o.add_argument("--connector-numbering", choices=["zigzag", "straight"],
+                   default="zigzag",
+                   help="dual-row pin numbering: zigzag = pins 1+2 share the "
+                        "first column (IDC/KiCad convention); straight = "
+                        "pins 1..n/2 across one row then the rest across "
+                        "the other")
     o.add_argument("--connector-footprint", metavar="LIB:NAME")
     o.add_argument("--tail-len", type=float, default=6.0,
                    help="ZIF tail length mm (default 6, min 5)")
