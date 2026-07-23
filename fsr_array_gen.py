@@ -115,11 +115,9 @@ CONNECTORS = {
                "  Mates with: PHR-{n} housing + SPH-002T-P0.5S crimp contacts"]),
     "zif": dict(
         kind="zif", pitch=1.00, pad=0.55, drill=0,
-        label="FFC/FPC tail for ZIF socket (bottom contacts)",
+        label="FFC/FPC tail for ZIF socket",
         order=["FFC/FPC tail: {n} contacts, {pitch} mm pitch, "
-               "contacts on the BACK side",
-               "  Mates with: any {n}-position {pitch} mm bottom-contact "
-               "FFC/FPC ZIF socket",
+               "contacts: {contacts}",
                "  e.g. Molex 200528 / TE 84952 family (1.0 mm), "
                "Molex 505110 (0.5 mm)",
                "  NOTE: add a stiffener under the tail so total thickness "
@@ -393,6 +391,14 @@ class Gen:
             self.tail_len = max(a.tail_len, 5.0)
             if self.tail_len != a.tail_len:
                 self.warnings.append("tail length clamped to 5.0 mm minimum")
+            # top/both contacts need a via inside each live finger to bond
+            # the two faces; those vias only fit at >= 0.8 mm pitch
+            self.tail_contacts = a.tail_contacts
+            if self.conn["pitch"] < 0.8 and self.tail_contacts != "bottom":
+                self.warnings.append(
+                    f"tail contacts forced to 'bottom': finger vias do not "
+                    f"fit at {self.conn['pitch']} mm pitch (need >= 0.8)")
+                self.tail_contacts = "bottom"
             p = self.conn["pitch"]
             span = (self.n_pads - 1) * p               # outer pad centers
             std_w = (self.n_pads + 1) * p              # JIS-standard FFC width
@@ -653,10 +659,19 @@ class Gen:
         if kind == "tht":
             self.seg(px, y_fan, px, self.pad_y, from_layer, net, w)
         elif kind == "zif":
-            # fingers are on B.Cu; F.Cu arrivals (columns) via just inside tab
-            if from_layer != "F.Cu":                     # already on B.Cu
+            tc = self.tail_contacts
+            if tc == "both":
+                # a pad exists on both faces and a finger via bonds them,
+                # so every arrival connects directly on its own layer
                 self.seg(px, y_fan, px, self.pad_y, from_layer, net, w)
+            elif (tc == "bottom") == (from_layer == "B.Cu"):
+                self.seg(px, y_fan, px, self.pad_y, from_layer, net, w)
+            elif tc == "top":
+                # B.Cu arrival, top-side finger: via lands inside the pad
+                self.seg(px, y_fan, px, self.pad_y - 1.0, from_layer, net, w)
+                self.via(px, self.pad_y - 1.0, net)
             else:
+                # F.Cu arrival, bottom-side finger: via just inside the tab
                 yv = self.board_h + (1.2 if pad_idx % 2 == 0 else 2.2)
                 self.seg(px, y_fan, px, yv, "F.Cu", net, w)
                 self.via(px, yv, net)
@@ -733,12 +748,20 @@ class Gen:
             self.pin_labels()
         elif kind == "zif":
             pw = self.conn["pitch"] * 0.55
+            tc = self.tail_contacts
+            sides = {"bottom": ['"B.Cu" "B.Mask"'], "top": ['"F.Cu" "F.Mask"'],
+                     "both": ['"B.Cu" "B.Mask"', '"F.Cu" "F.Mask"']}[tc]
             pads = [dict(num=str(i + 1), ptype="smd", shape="rect",
                          px=self.pad_dx[i] - self.pad_dx[0], py=0,
-                         sx=round(pw, 3), sy=3.0, layers='"B.Cu" "B.Mask"',
-                         net=nets[i]) for i in range(self.n_pads)]
+                         sx=round(pw, 3), sy=3.0, layers=lay,
+                         net=nets[i])
+                    for i in range(self.n_pads) for lay in sides]
+            if tc == "both":     # bond the two faces of every live finger
+                for i in range(self.n_pads):
+                    if nets[i]:
+                        self.via(self.pad_xs[i], self.pad_y - 1.0, nets[i][0])
             self.gen_footprint(
-                f"zif_tail_1x{self.n_pads}_P{self.conn['pitch']}mm", "B.Cu",
+                f"zif_tail_1x{self.n_pads}_P{self.conn['pitch']}mm_{tc}", "B.Cu",
                 "exclude_from_pos_files",
                 [("reference", "J1", -self.pad_dx[0], -3.4, "B.SilkS"),
                  ("value", f"ZIF tail P{self.conn['pitch']}mm",
@@ -823,9 +846,13 @@ class Gen:
                 if a.fixed_pins else
                 f"pins 1-{a.rows} = rows, {a.rows + 1}-{n} = columns")
              + "):"]
+        cdesc = {"bottom": "BACK side only", "top": "FRONT side only",
+                 "both": "BOTH sides (works with top- or bottom-contact "
+                         "sockets; pick orientation at assembly)"}
         for line in self.conn.get("order", []):
-            L.append("  " + line.format(n=n, pitch=self.conn["pitch"],
-                                        fp=self.lib_spec or ""))
+            L.append("  " + line.format(
+                n=n, pitch=self.conn["pitch"], fp=self.lib_spec or "",
+                contacts=cdesc.get(getattr(self, "tail_contacts", ""), "")))
         if self.lib_spec:
             L.append(f"  KiCad footprint used: {self.lib_spec}"
                      + (f" (rotated {self.lib_rot} deg)" if self.lib_rot else ""))
@@ -835,15 +862,23 @@ class Gen:
             L += ["",
                   "Mating ZIF socket (this goes on your READOUT board, "
                   "not the sensor):",
-                  f"  {n}-position, {p} mm pitch, BOTTOM-contact, horizontal "
-                  "FFC/FPC ZIF socket",
+                  f"  {n}-position, {p} mm pitch, "
+                  + {"bottom": "BOTTOM-contact",
+                     "top": "TOP-contact",
+                     "both": "top- OR bottom-contact (either works)"
+                     }[self.tail_contacts]
+                  + ", horizontal FFC/FPC ZIF socket",
                   f"  Tail dimensions: {self.tab_w:.1f} mm wide x "
                   f"{self.tail_len:.1f} mm long "
                   f"(standard slot width for {n}p/{p} mm: "
                   f"{(n + 1) * p:.1f} mm)",
                   "  Insertion thickness must be 0.30 mm total: board is "
                   f"{th} mm -> add a {max(0.30 - th, 0):.2f} mm stiffener "
-                  "(polyimide/FR4) on the FRONT of the tail",
+                  "(polyimide/FR4) on the "
+                  + ("side facing AWAY from your socket's contacts"
+                     if self.tail_contacts == "both" else
+                     ("BACK" if self.tail_contacts == "top" else "FRONT")
+                     + " of the tail"),
                   "  Typical insertion depth ~4 mm; ENIG finish on the "
                   "fingers (same order as the board)"]
             if self.edge_rule:
@@ -999,6 +1034,10 @@ def main():
     o.add_argument("--tail-w", type=float,
                    help="ZIF tail width mm (default: standard FFC width "
                         "= (n_pins+1) x pitch, so it fits a standard socket)")
+    o.add_argument("--tail-contacts", choices=["both", "bottom", "top"],
+                   default="both",
+                   help="which face(s) of the ZIF tail carry contacts "
+                        "(default both: either socket style works)")
     o.add_argument("--list-connectors", metavar="PATTERN", nargs="?", const="")
     o.add_argument("--fixed-pins", action="store_true",
                    help="always use a 16-pin connector (pins 1-8 rows, 9-16 "
