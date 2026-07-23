@@ -148,6 +148,9 @@ a.dl { color:var(--acc); }
       <div class="f"><label>Angle</label>
         <select name="connector_angle"><option value="vertical">vertical</option>
         <option value="horizontal">right-angle</option></select></div>
+      <div class="f"><label>Rows</label>
+        <select name="connector_rows"><option value="1">1</option>
+        <option value="2">2</option></select></div>
       <div class="f"><label>Conn. pitch mm (opt)</label>
         <input name="connector_pitch" placeholder="default"></div>
     </div>
@@ -270,6 +273,7 @@ def run_gen(data):
              "--hole-size", data.get("hole_size", "m3"),
              "--connector-mount", data.get("connector_mount", "tht"),
              "--connector-angle", data.get("connector_angle", "vertical"),
+             "--connector-rows", data.get("connector_rows", "1"),
              "--contacts", data.get("contacts", "top")]
     if data.get("connector") == "lib" and data.get("connector_footprint"):
         args += ["--connector-footprint", data["connector_footprint"]]

@@ -95,27 +95,30 @@ CONNECTORS = {
     "tht": dict(
         kind="tht", pitch=2.54, pad=1.7, drill=1.0,
         label="Pin header 2.54 mm",
-        lib="Connector_PinHeader_2.54mm:PinHeader_1x{n}_P2.54mm_Vertical",
-        lib_h="Connector_PinHeader_2.54mm:PinHeader_1x{n}_P2.54mm_Horizontal",
+        lib="Connector_PinHeader_2.54mm:PinHeader_1x{n2}_P2.54mm_Vertical",
+        lib_h="Connector_PinHeader_2.54mm:PinHeader_1x{n2}_P2.54mm_Horizontal",
         lib_smd="Connector_PinHeader_2.54mm:"
-                "PinHeader_1x{n}_P2.54mm_Vertical_SMD_Pin1Left",
+                "PinHeader_1x{n2}_P2.54mm_Vertical_SMD_Pin1Left",
+        lib2="Connector_PinHeader_2.54mm:PinHeader_2x{rc}_P2.54mm_Vertical",
+        lib2_h="Connector_PinHeader_2.54mm:PinHeader_2x{rc}_P2.54mm_Horizontal",
+        lib2_smd="Connector_PinHeader_2.54mm:PinHeader_2x{rc}_P2.54mm_Vertical_SMD",
         order=["Generic male pin header, 1x{n}, 2.54 mm pitch, {mount}",
                "  e.g. Wurth 61301611121 family or any breakaway header",
                "  Mates with: standard 2.54 mm DuPont / jumper-wire housings"]),
     "jst-xh": dict(
         kind="tht", pitch=2.50, pad=1.8, drill=1.0,
         label="JST XH (B{n}B-XH-A)",
-        lib="Connector_JST:JST_XH_B{n}B-XH-A_1x{n}_P2.50mm_Vertical",
-        lib_h="Connector_JST:JST_XH_S{n}B-XH-A_1x{n}_P2.50mm_Horizontal",
+        lib="Connector_JST:JST_XH_B{n}B-XH-A_1x{n2}_P2.50mm_Vertical",
+        lib_h="Connector_JST:JST_XH_S{n}B-XH-A_1x{n2}_P2.50mm_Horizontal",
         order=["JST XH shrouded header, MPN: {bs}{n}B-XH-A",
                "  {n} pins, 2.50 mm pitch, {mount}",
                "  Mates with: XHP-{n} housing + SXH-001T-P0.6 crimp contacts"]),
     "jst-ph": dict(
         kind="tht", pitch=2.00, pad=1.3, drill=0.75,
         label="JST PH (B{n}B-PH-K)",
-        lib="Connector_JST:JST_PH_B{n}B-PH-K_1x{n}_P2.00mm_Vertical",
-        lib_h="Connector_JST:JST_PH_S{n}B-PH-K_1x{n}_P2.00mm_Horizontal",
-        lib_smd="Connector_JST:JST_PH_B{n}B-PH-SM4-TB_1x{n}-1MP_P2.00mm_Vertical",
+        lib="Connector_JST:JST_PH_B{n}B-PH-K_1x{n2}_P2.00mm_Vertical",
+        lib_h="Connector_JST:JST_PH_S{n}B-PH-K_1x{n2}_P2.00mm_Horizontal",
+        lib_smd="Connector_JST:JST_PH_B{n}B-PH-SM4-TB_1x{n2}-1MP_P2.00mm_Vertical",
         order=["JST PH header, MPN: {bs}{n}B-PH-K "
                "(SMD variant: {bs}{n}B-PH-SM4-TB)",
                "  {n} pins, 2.00 mm pitch, {mount}",
@@ -224,9 +227,10 @@ print(json.dumps(res))""")
     return _DUMP_CACHE[spec]
 
 
-def pick_rotation(dumps, n_need, flip=False):
-    """Choose the rotation where numbered pads run left-to-right: one row
-    preferred, then a loose pass for staggered-row (SMD header) pads."""
+def pick_rotation(dumps, n_need, flip=False, rows=1):
+    """Choose the rotation where numbered pads run left-to-right.
+    rows=1: one pad row (loose second pass allows staggered SMD headers).
+    rows=2: zigzag numbering — column pairs share x, columns ascend."""
     sfx = "f" if flip else ""
     for tol in (0.05, 4.0):
         for rot in ("0", "90", "270", "180"):
@@ -238,8 +242,18 @@ def pick_rotation(dumps, n_need, flip=False):
                 return None, None
             ys = [p["y"] for p in pads]
             xs = [p["x"] for p in pads]
-            if max(ys) - min(ys) <= tol and all(b > a for a, b in zip(xs, xs[1:])):
-                return int(rot), d
+            if rows == 1:
+                if max(ys) - min(ys) <= tol and \
+                        all(b > a for a, b in zip(xs, xs[1:])):
+                    return int(rot), d
+            else:
+                cols = n_need // rows
+                grp = [xs[k * rows:(k + 1) * rows] for k in range(cols)]
+                col_x = [g[0] for g in grp]
+                if (all(max(g) - min(g) <= 0.05 for g in grp)
+                        and all(b > a for a, b in zip(col_x, col_x[1:]))
+                        and max(ys) - min(ys) > 0.5):
+                    return int(rot), d
     return None, None
 
 
@@ -259,12 +273,26 @@ class Gen:
         a = self.a
         R, C = a.rows, a.cols
         self.warnings = []          # reset: this method may run iteratively
+        self.body_up = 0.0
         # fixed mode: always a 16-pin connector (pins 1-8 rows, 9-16 cols,
         # unused positions NC) so one cable/readout fits any array size
         if a.fixed_pins and (R > 8 or C > 8):
             sys.exit("--fixed-pins supports up to 8x8")
         self.n_pads = 16 if a.fixed_pins else R + C
         self.col_pad0 = 8 if a.fixed_pins else R
+        self.c_rows = a.connector_rows
+        if self.c_rows > 1:
+            if a.connector == "zif":
+                self.warnings.append("--connector-rows does not apply to the "
+                                     "ZIF tail; using 1 row")
+                self.c_rows = 1
+            elif a.connector in ("jst-xh", "jst-ph"):
+                sys.exit("2-row connectors: JST XH/PH have no dual-row "
+                         "variant routable at their pitch — use --connector "
+                         "tht (pin header) or --connector lib")
+            elif self.n_pads % self.c_rows:
+                sys.exit(f"{self.n_pads} pins cannot divide evenly into "
+                         f"{self.c_rows} rows")
 
         # --- auto-optimal comb / sensel parameters (explicit values win) ---
         a.trace = a.trace or DEF_TRACE
@@ -305,10 +333,13 @@ class Gen:
                          "(discover names with --list-connectors)")
             self._load_lib_connector(a.connector_footprint, flip)
         elif a.connector != "zif" and not a.connector_pitch:
-            key = ("lib" + ("_smd" if a.connector_mount == "smd" else "")
+            key = (("lib2" if self.c_rows == 2 else "lib")
+                   + ("_smd" if a.connector_mount == "smd" else "")
                    + ("_h" if a.connector_angle == "horizontal" else ""))
             tpl = self.conn.get(key)
-            spec = tpl.format(n=self.n_pads) if tpl else None
+            spec = tpl.format(n=self.n_pads, n2=f"{self.n_pads:02d}",
+                              rc=f"{self.n_pads // self.c_rows:02d}") \
+                if tpl else None
             if spec and lib_exists(spec) and KICAD["python"]:
                 self._load_lib_connector(spec, flip)
             else:
@@ -392,28 +423,53 @@ class Gen:
         self.arr_r = self.arr_x + self.arr_w
         self.arr_b = self.arr_y + self.arr_h
 
-        # --- connector pad positions (x) ---
+        # --- connector pad positions ---
+        pt = self.conn["pitch"]
         if self.libpads:
-            xs = [p["x"] for p in self.libpads]
-            ctr = (min(xs) + max(xs)) / 2
-            self.pad_dx = [x - ctr for x in xs]
+            cxs = [q["x"] for q in self.libpads]
+            cys = [q["y"] for q in self.libpads]
+        else:  # generated: zigzag numbering, pin 1+2 share the first column
+            cxs = [(i // self.c_rows) * pt for i in range(self.n_pads)]
+            cys = [(i % self.c_rows) * pt for i in range(self.n_pads)]
+        ctr = (min(cxs) + max(cxs)) / 2
+        ymid = (min(cys) + max(cys)) / 2
+        self.pad_cdx = [x - ctr for x in cxs]        # pad centers, rel
+        self.pad_cy = [y - ymid for y in cys]        # rel to pad-field mid
+        if self.c_rows == 2:
+            # far-row pads are reached by dropping between the columns; the
+            # offset goes toward the pad's side of its pair so the drop-x
+            # sequence stays strictly ascending (the fan nesting needs it)
+            uniq = sorted({round(x, 3) for x in cxs})
+            self.colp2 = uniq[1] - uniq[0] if len(uniq) > 1 else pt
+            self.pad_dx = list(self.pad_cdx)
+            for k in range(self.n_pads // 2):
+                i0, i1 = 2 * k, 2 * k + 1
+                if self.pad_cy[i0] > self.pad_cy[i1]:   # far pad first
+                    self.pad_dx[i0] -= self.colp2 / 2
+                else:                                   # far pad second
+                    self.pad_dx[i1] += self.colp2 / 2
         else:
-            p = self.conn["pitch"]
-            self.pad_dx = [(i - (self.n_pads - 1) / 2) * p
-                           for i in range(self.n_pads)]
+            self.pad_dx = list(self.pad_cdx)
         self.conn_cx = self.board_w / 2
-        self.pad_xs = [self.conn_cx + d for d in self.pad_dx]
+        self.pad_xs = [self.conn_cx + d for d in self.pad_dx]    # fan targets
+        self.pad_cxs = [self.conn_cx + d for d in self.pad_cdx]  # pad centers
         diffs = [b - a_ for a_, b in zip(self.pad_xs, self.pad_xs[1:])]
         self.conn_pitch_min = min(diffs) if diffs else 2.54
         # narrow fan/drop traces when the connector is finer than the comb trace
         self.drop_w = min(a.trace, max(self.conn_pitch_min / 2, 0.15))
+        if self.c_rows == 2:
+            self.drop_w = min(self.drop_w, 0.3)
+            pad_sz = 1.7 if self.libpads else self.conn["pad"]
+            clear = self.colp2 / 2 - pad_sz / 2 - self.drop_w / 2
+            if clear < 0.2:
+                sys.exit(f"2-row layout not routable: {clear:.2f} mm between "
+                         f"pads at {self.colp2} mm column pitch")
         # x-extent physically occupied by the connector (body, not just pads)
         if self.libpads:
-            xs = [p["x"] for p in self.libpads]
-            ox = self.conn_cx - (min(xs) + max(xs)) / 2
+            ox = self.conn_cx - ctr
             self.conn_ext = (ox + self.libbox[2], ox + self.libbox[3])
         else:
-            self.conn_ext = (min(self.pad_xs) - 2.0, max(self.pad_xs) + 2.0)
+            self.conn_ext = (min(self.pad_cxs) - 2.0, max(self.pad_cxs) + 2.0)
 
         # --- column fan grouping / bands ---
         self.col_left = [c for c in range(C)
@@ -487,6 +543,8 @@ class Gen:
                             "the board edge")
                     if (self._lib_ymid - self.libbox[0]
                             > self.libbox[1] - self._lib_ymid):
+                        # body lies over the board: keep it out of the window
+                        self.body_up = self._lib_ymid - self.libbox[0]
                         self.warnings.append(
                             f"{self.lib_spec}: this footprint's entry faces "
                             "the board interior at the pin-1-left rotation; "
@@ -502,6 +560,9 @@ class Gen:
                         self.drop_gap,
                         self._lib_ymid - self.libbox[0] + 0.6)
             min_h = self.row_deep + self.drop_gap + tail
+            if getattr(self, "body_up", 0):
+                min_h = max(min_h,
+                            self.arr_b + MASK_M + 0.4 + self.body_up + tail)
         self.board_h = a.board_h or min_h
         # board-dims auto-fit: the sensor height came from an estimate;
         # measure the real leftover and re-derive until the body bottom
@@ -519,7 +580,7 @@ class Gen:
 
     def _load_lib_connector(self, spec, flip=False):
         dumps = dump_lib_footprint(spec)
-        rot, d = pick_rotation(dumps, self.n_pads, flip)
+        rot, d = pick_rotation(dumps, self.n_pads, flip, self.c_rows)
         if rot is None:
             rot, d = 0, dumps["0f" if flip else "0"]
             self.warnings.append(
@@ -743,19 +804,31 @@ class Gen:
         """Route from a fan level down into connector pad pad_idx."""
         kind = self.conn["kind"]
         w = self.drop_w
+        cxp = self.pad_cxs[pad_idx]          # pad center (back-row pads are
+                                             # entered via a small jog)
         if kind == "tht":
-            self.seg(px, y_fan, px, self.pad_y, from_layer, net, w)
+            py = self.pad_y + self.pad_cy[pad_idx]
+            self.seg(px, y_fan, px, py, from_layer, net, w)
+            if abs(cxp - px) > 0.01:
+                self.seg(px, py, cxp, py, from_layer, net, w)
         elif kind == "smd":
             front = self.conn_side == "top"
+            lay = "F.Cu" if front else "B.Cu"
+            py = self.pad_y + self.pad_cy[pad_idx]
             if (from_layer == "F.Cu") == front:
-                self.seg(px, y_fan, px, self.pad_y, from_layer, net, w)
+                self.seg(px, y_fan, px, py, from_layer, net, w)
+                if abs(cxp - px) > 0.01:
+                    self.seg(px, py, cxp, py, from_layer, net, w)
             else:
-                yv = (max(self.row_deep + 0.9, self.pad_y - 2.0)
+                base = self.pad_y + (min(self.pad_cy) if self.c_rows == 2
+                                     else self.pad_cy[pad_idx])
+                yv = (max(self.row_deep + 0.9, base - 2.0)
                       + (0.8 if pad_idx % 2 else 0))
                 self.seg(px, y_fan, px, yv, from_layer, net, w)
                 self.via(px, yv, net)
-                self.seg(px, yv, px, self.pad_y,
-                         "F.Cu" if front else "B.Cu", net, w)
+                self.seg(px, yv, px, py, lay, net, w)
+                if abs(cxp - px) > 0.01:
+                    self.seg(px, py, cxp, py, lay, net, w)
         elif kind == "zif":
             tc = self.tail_contacts
             if tc == "both":
@@ -779,14 +852,21 @@ class Gen:
             pad_y = self.pad_y + p["y"] - self._lib_ymid
             if p["thru"] or p["front"] == (from_layer == "F.Cu"):
                 self.seg(px, y_fan, px, pad_y, from_layer, net, w)
+                if abs(cxp - px) > 0.01:
+                    self.seg(px, pad_y, cxp, pad_y, from_layer, net, w)
             else:
-                # layer change: via must sit BELOW the row fan band (clearance!)
-                yv = (max(self.row_deep + 0.9, pad_y - 2.0)
+                # layer change: via must sit BELOW the row fan band and,
+                # for 2-row connectors, above the whole pad field
+                base = self.pad_y + (min(self.pad_cy) if self.c_rows == 2
+                                     else self.pad_cy[pad_idx])
+                yv = (max(self.row_deep + 0.9, base - 2.0)
                       + (0.8 if pad_idx % 2 else 0))            # stagger vias
                 self.seg(px, y_fan, px, yv, from_layer, net, w)
                 self.via(px, yv, net)
                 other = "F.Cu" if p["front"] else "B.Cu"
                 self.seg(px, yv, px, pad_y, other, net, w)
+                if abs(cxp - px) > 0.01:
+                    self.seg(px, pad_y, cxp, pad_y, other, net, w)
 
     def pad_names(self):
         """Net name per pad; '' = NC (fixed mode's unused positions)."""
@@ -854,33 +934,37 @@ class Gen:
         elif kind == "tht":
             pads = [dict(num=str(i + 1), ptype="thru_hole",
                          shape="rect" if i == 0 else "circle",
-                         px=self.pad_dx[i] - self.pad_dx[0], py=0,
+                         px=self.pad_cdx[i] - self.pad_cdx[0],
+                         py=self.pad_cy[i] - self.pad_cy[0],
                          sx=self.conn["pad"], sy=self.conn["pad"],
                          drill=self.conn["drill"], layers='"*.Cu" "*.Mask"',
                          net=nets[i]) for i in range(self.n_pads)]
             self.gen_footprint(
-                f"{a.connector}_1x{self.n_pads}", "F.Cu", "through_hole",
-                [("reference", "J1", -self.pad_dx[0], -4.2, "B.SilkS"),
+                f"{a.connector}_{self.c_rows}x{self.n_pads // self.c_rows}",
+                "F.Cu", "through_hole",
+                [("reference", "J1", -self.pad_cdx[0], -4.2, "B.SilkS"),
                  ("value", self.conn["label"].replace("{n}", str(self.n_pads)),
-                  -self.pad_dx[0], 2.6, "B.Fab")],
-                pads, self.pad_xs[0], self.pad_y)
+                  -self.pad_cdx[0], 4.2, "B.Fab")],
+                pads, self.pad_cxs[0], self.pad_y + self.pad_cy[0])
             self.pin_labels()
         elif kind == "smd":
             front = self.conn_side == "top"
             lay = '"F.Cu" "F.Mask" "F.Paste"' if front else \
                   '"B.Cu" "B.Mask" "B.Paste"'
             pw = min(self.conn["pitch"] * 0.5, 1.2)
+            ph = 3.0 if self.c_rows == 1 else round(self.conn["pitch"] - 0.5, 2)
             pads = [dict(num=str(i + 1), ptype="smd", shape="rect",
-                         px=self.pad_dx[i] - self.pad_dx[0], py=0,
-                         sx=round(pw, 3), sy=3.0, layers=lay,
+                         px=self.pad_cdx[i] - self.pad_cdx[0],
+                         py=self.pad_cy[i] - self.pad_cy[0],
+                         sx=round(pw, 3), sy=ph, layers=lay,
                          net=nets[i]) for i in range(self.n_pads)]
             self.gen_footprint(
-                f"{a.connector}_smd_1x{self.n_pads}",
+                f"{a.connector}_smd_{self.c_rows}x{self.n_pads // self.c_rows}",
                 "F.Cu" if front else "B.Cu", "smd",
-                [("reference", "J1", -self.pad_dx[0], -4.2, "B.SilkS"),
+                [("reference", "J1", -self.pad_cdx[0], -4.2, "B.SilkS"),
                  ("value", self.conn["label"].replace("{n}", str(self.n_pads))
-                  + " SMD", -self.pad_dx[0], 2.6, "B.Fab")],
-                pads, self.pad_xs[0], self.pad_y)
+                  + " SMD", -self.pad_cdx[0], 4.2, "B.Fab")],
+                pads, self.pad_cxs[0], self.pad_y + self.pad_cy[0])
             self.pin_labels()
         elif kind == "zif":
             pw = self.conn["pitch"] * 0.55
@@ -1003,6 +1087,11 @@ class Gen:
                      "side of the board"
                      + ("" if a.connector_mount == "smd" else
                         "; through-hole: insert from that side"))
+            if self.c_rows > 1:
+                L.append(f"  {self.c_rows} rows x "
+                         f"{n // self.c_rows} pins, zigzag numbering "
+                         "(pins 1+2 share the first column, odd = one row, "
+                         "even = the other)")
             if getattr(self, "overhang", 0) > 0.05:
                 L.append(f"  Body/entry overhangs the board edge by "
                          f"{self.overhang:.1f} mm - only the solder pads "
@@ -1198,6 +1287,10 @@ def main():
                    default="vertical",
                    help="vertical (top entry) or horizontal / right-angle "
                         "(side entry) connector (non-ZIF; default vertical)")
+    o.add_argument("--connector-rows", type=int, choices=[1, 2], default=1,
+                   help="connector rows (non-ZIF; default 1): 2 splits the "
+                        "pins into two equal rows (e.g. 2x8 for 16 pins, "
+                        "zigzag numbering); pin count must divide evenly")
     o.add_argument("--connector-footprint", metavar="LIB:NAME")
     o.add_argument("--tail-len", type=float, default=6.0,
                    help="ZIF tail length mm (default 6, min 5)")

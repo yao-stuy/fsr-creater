@@ -101,6 +101,7 @@ Run `python3 fsr_array_gen.py --help` for the full option reference.
 | | `--connector-pitch` | override the connector's default pitch, mm |
 | | `--connector-mount {tht,smd}` | through-hole or surface-mount connector variant (default tht) |
 | | `--connector-angle {vertical,horizontal}` | vertical (top entry) or right-angle (side entry) connector (default vertical) |
+| | `--connector-rows {1,2}` | split the pins into two equal rows (e.g. 2×8 header for 16 pins, zigzag numbering); pin count must divide evenly (default 1) |
 | | `--contacts {top,bottom,both}` | ZIF: which tail face(s) carry fingers. Other connectors: which side of the board the connector mounts on. Default top |
 | | `--connector-footprint LIB:NAME` | required with `--connector lib` |
 | | `--tail-len` | ZIF/FFC tail length, mm (default 6, min 5) |
