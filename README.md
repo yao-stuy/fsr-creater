@@ -158,6 +158,9 @@ one, check the coordinates in `<project>/drc.rpt` before ordering boards.
   <project-name>.kicad_pro
   ORDER_INFO.txt             # connector MPN/pitch, mating parts, hole sizes,
                              # fab notes — everything needed to order
+  FSR.pretty/                # project footprint library for any generated
+  fp-lib-table               # footprints (ZIF tail, fallbacks) — only
+                             # present when one was needed
   drc.rpt                    # full, unfiltered DRC report
   preview_front.svg
   preview_back.svg

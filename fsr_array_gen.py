@@ -44,9 +44,9 @@ import uuid
 
 # ---------------- fixed layout constants (mm) ----------------
 MASK_M    = 1.5    # mask/coverlay opening margin around the sensing area
-EDGE_KEEP = 1.2    # copper keep-in from board edge
-VIA_OFF   = 2.2    # row escape via offset from the array edge
-STAG_R    = 0.8    # stagger between row escape verticals
+EDGE_KEEP = 0.8    # copper keep-in from board edge (0.5 rule + margin)
+VIA_OFF   = 2.0    # escape via offset: via ring must clear the mask window
+STAG_R    = 0.72   # stagger between row escape verticals (0.2 rule + margin)
 COL_STEP  = 0.7    # column fan level spacing (F.Cu band)
 ROW_STEP  = 0.8    # row fan level spacing (B.Cu band)
 BAND_GAP  = 0.9    # gap between array/col band/row band
@@ -227,7 +227,8 @@ class Gen:
         self.a = a
         self.segs, self.vias, self.extra, self.fps = [], [], [], []
         self.warnings = []
-        self.lib_adds = []          # footprints for pcbnew to place
+        self.lib_adds = []          # KiCad-library footprints for pcbnew
+        self.gen_lib = {}           # generated footprints -> project FSR.pretty
         self.resolve_geometry()
 
     # ---------- geometry resolution ----------
@@ -438,6 +439,41 @@ class Gen:
     def rnet(self, r): return r + 1
     def cnet(self, c): return self.a.rows + c + 1
 
+    def gen_footprint(self, name, layer, attr, texts, pads, x, y):
+        """Generated footprint: embed in the board AND store a .kicad_mod
+        copy for the project's FSR.pretty library (so KiCad's config check
+        can resolve 'FSR:<name>' instead of warning about a missing lib).
+        texts: (kind, text, x, y, layer); pads: dicts, net=(no, name)|None.
+        """
+        def body(lib):
+            L = [f'(footprint "{name if lib else "FSR:" + name}"'
+                 + (' (version 20240108) (generator "fsr_array_gen")' if lib
+                    else f' (layer "{layer}") (uuid "{uid()}") '
+                         f'(at {x:.3f} {y:.3f})')]
+            if lib:
+                L.append(f'  (layer "{layer}")')
+            if attr:
+                L.append(f'  (attr {attr})')
+            for kind, txt, tx, ty, tl in texts:
+                t = "REF**" if (lib and kind == "reference") else txt
+                mir = ' (justify mirror)' if tl.startswith("B.") else ''
+                L.append(
+                    f'  (fp_text {kind} "{t}" (at {tx:.3f} {ty:.3f}) '
+                    f'(layer "{tl}") (uuid "{uid()}")\n'
+                    f'    (effects (font (size 1 1) (thickness 0.15)){mir}))')
+            for p in pads:
+                net = (f' (net {p["net"][0]} "{p["net"][1]}")'
+                       if (not lib and p.get("net")) else '')
+                drill = f' (drill {p["drill"]})' if p.get("drill") else ''
+                L.append(
+                    f'  (pad "{p["num"]}" {p["ptype"]} {p["shape"]} '
+                    f'(at {p["px"]:.3f} {p["py"]:.3f}) (size {p["sx"]} {p["sy"]})'
+                    f'{drill} (layers {p["layers"]}){net} (uuid "{uid()}"))')
+            L.append(')')
+            return "\n".join(L if lib else ["  " + l for l in L])
+        self.fps.append(body(False))
+        self.gen_lib[name] = body(True)
+
     # ---------- build ----------
     def build(self):
         a = self.a
@@ -529,19 +565,15 @@ class Gen:
                                               hide_ref=True))
             else:                                # generated NPTH fallback
                 for i, (mx, my) in enumerate(pts):
-                    self.fps.append(
-                        f'  (footprint "FSR:MountingHole" (layer "F.Cu") '
-                        f'(uuid "{uid()}") (at {mx:.3f} {my:.3f})\n'
-                        f'    (attr exclude_from_pos_files exclude_from_bom)\n'
-                        f'    (fp_text reference "H{i + 1}" (at 0 -3) (layer "F.Fab") '
-                        f'(uuid "{uid()}")\n'
-                        f'      (effects (font (size 1 1) (thickness 0.15))))\n'
-                        f'    (fp_text value "{self.a.hole_size.upper()}" (at 0 3) '
-                        f'(layer "F.Fab") (uuid "{uid()}")\n'
-                        f'      (effects (font (size 1 1) (thickness 0.15))))\n'
-                        f'    (pad "" np_thru_hole circle (at 0 0) '
-                        f'(size {self.hole_d} {self.hole_d}) (drill {self.hole_d}) '
-                        f'(layers "*.Cu" "*.Mask") (uuid "{uid()}"))\n  )')
+                    self.gen_footprint(
+                        f"MountingHole_{self.a.hole_size.upper()}", "F.Cu",
+                        "exclude_from_pos_files exclude_from_bom",
+                        [("reference", f"H{i + 1}", 0, -3, "F.Fab"),
+                         ("value", self.a.hole_size.upper(), 0, 3, "F.Fab")],
+                        [dict(num="", ptype="np_thru_hole", shape="circle",
+                              px=0, py=0, sx=self.hole_d, sy=self.hole_d,
+                              drill=self.hole_d, layers='"*.Cu" "*.Mask"')],
+                        mx, my)
 
         # 6. mask opening, outline, back silk ---------------------
         mx0, my0 = self.arr_x - MASK_M, self.arr_y - MASK_M
@@ -628,44 +660,32 @@ class Gen:
                 nets={p["num"]: names[i] for i, p in enumerate(self.libpads)}))
             self.pin_labels()
         elif kind == "tht":
-            pads = []
-            for i in range(self.n_pads):
-                shape = "rect" if i == 0 else "circle"
-                pads.append(
-                    f'    (pad "{i + 1}" thru_hole {shape} (at {self.pad_dx[i] - self.pad_dx[0]:.3f} 0) '
-                    f'(size {self.conn["pad"]} {self.conn["pad"]}) (drill {self.conn["drill"]}) '
-                    f'(layers "*.Cu" "*.Mask") (net {i + 1} "{names[i]}") (uuid "{uid()}"))')
-            self.fps.append(
-                f'  (footprint "FSR:{a.connector}_1x{self.n_pads}" (layer "F.Cu") '
-                f'(uuid "{uid()}") (at {self.pad_xs[0]:.3f} {self.pad_y:.3f})\n'
-                f'    (attr through_hole)\n'
-                f'    (fp_text reference "J1" (at {-self.pad_dx[0]:.3f} -2.6) '
-                f'(layer "B.SilkS") (uuid "{uid()}")\n'
-                f'      (effects (font (size 1 1) (thickness 0.15)) (justify mirror)))\n'
-                f'    (fp_text value "{self.conn["label"].replace("{n}", str(self.n_pads))}" '
-                f'(at {-self.pad_dx[0]:.3f} 2.6) (layer "B.Fab") (uuid "{uid()}")\n'
-                f'      (effects (font (size 1 1) (thickness 0.15)) (justify mirror)))\n'
-                + "\n".join(pads) + "\n  )")
+            pads = [dict(num=str(i + 1), ptype="thru_hole",
+                         shape="rect" if i == 0 else "circle",
+                         px=self.pad_dx[i] - self.pad_dx[0], py=0,
+                         sx=self.conn["pad"], sy=self.conn["pad"],
+                         drill=self.conn["drill"], layers='"*.Cu" "*.Mask"',
+                         net=(i + 1, names[i])) for i in range(self.n_pads)]
+            self.gen_footprint(
+                f"{a.connector}_1x{self.n_pads}", "F.Cu", "through_hole",
+                [("reference", "J1", -self.pad_dx[0], -4.2, "B.SilkS"),
+                 ("value", self.conn["label"].replace("{n}", str(self.n_pads)),
+                  -self.pad_dx[0], 2.6, "B.Fab")],
+                pads, self.pad_xs[0], self.pad_y)
             self.pin_labels()
         elif kind == "zif":
             pw = self.conn["pitch"] * 0.55
-            pads = []
-            for i in range(self.n_pads):
-                pads.append(
-                    f'    (pad "{i + 1}" smd rect (at {self.pad_dx[i] - self.pad_dx[0]:.3f} 0) '
-                    f'(size {pw:.3f} 3.0) (layers "B.Cu" "B.Mask") '
-                    f'(net {i + 1} "{names[i]}") (uuid "{uid()}"))')
-            self.fps.append(
-                f'  (footprint "FSR:zif_tail_1x{self.n_pads}" (layer "B.Cu") '
-                f'(uuid "{uid()}") (at {self.pad_xs[0]:.3f} {self.pad_y:.3f})\n'
-                f'    (attr exclude_from_pos_files)\n'
-                f'    (fp_text reference "J1" (at {-self.pad_dx[0]:.3f} -3.4) '
-                f'(layer "B.SilkS") (uuid "{uid()}")\n'
-                f'      (effects (font (size 1 1) (thickness 0.15)) (justify mirror)))\n'
-                f'    (fp_text value "ZIF tail P{self.conn["pitch"]}mm" '
-                f'(at {-self.pad_dx[0]:.3f} -5.2) (layer "B.Fab") (uuid "{uid()}")\n'
-                f'      (effects (font (size 1 1) (thickness 0.15)) (justify mirror)))\n'
-                + "\n".join(pads) + "\n  )")
+            pads = [dict(num=str(i + 1), ptype="smd", shape="rect",
+                         px=self.pad_dx[i] - self.pad_dx[0], py=0,
+                         sx=round(pw, 3), sy=3.0, layers='"B.Cu" "B.Mask"',
+                         net=(i + 1, names[i])) for i in range(self.n_pads)]
+            self.gen_footprint(
+                f"zif_tail_1x{self.n_pads}_P{self.conn['pitch']}mm", "B.Cu",
+                "exclude_from_pos_files",
+                [("reference", "J1", -self.pad_dx[0], -3.4, "B.SilkS"),
+                 ("value", f"ZIF tail P{self.conn['pitch']}mm",
+                  -self.pad_dx[0], -5.2, "B.Fab")],
+                pads, self.pad_xs[0], self.pad_y)
 
     def make_outline(self):
         w, h = self.board_w, self.board_h
@@ -896,6 +916,19 @@ def main():
         f.write(gen.board_text())
     with open(os.path.join(folder, f"{name}.kicad_pro"), "w") as f:
         json.dump({"meta": {"filename": f"{name}.kicad_pro", "version": 3}}, f, indent=2)
+
+    if gen.gen_lib:
+        # project-local footprint library so 'FSR:*' footprints resolve
+        libdir = os.path.join(folder, "FSR.pretty")
+        os.makedirs(libdir, exist_ok=True)
+        for fp_name, text in gen.gen_lib.items():
+            with open(os.path.join(libdir, f"{fp_name}.kicad_mod"), "w") as f:
+                f.write(text + "\n")
+        with open(os.path.join(folder, "fp-lib-table"), "w") as f:
+            f.write('(fp_lib_table\n  (version 7)\n'
+                    '  (lib (name "FSR")(type "KiCad")'
+                    '(uri "${KIPRJMOD}/FSR.pretty")(options "")'
+                    '(descr "generated by fsr_array_gen"))\n)\n')
 
     if finalize_with_pcbnew(gen, pcb):
         print(f"Saved {pcb} in native KiCad 10 format")
