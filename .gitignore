@@ -1,0 +1,16 @@
+# Generated KiCad projects (created by fsr_array_gen.py / fsr_ui.py) —
+# these are build output, not part of the tool, and are excluded on purpose.
+/fsr_*/
+*.kicad_pcb
+*.kicad_pro
+*.kicad_prl
+*.svg
+*.zip
+drc.rpt
+/gerbers/
+
+# Editor / OS cruft
+.DS_Store
+.history/
+__pycache__/
+*.pyc
