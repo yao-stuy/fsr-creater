@@ -96,6 +96,7 @@ CONNECTORS = {
         kind="tht", pitch=2.54, pad=1.7, drill=1.0,
         label="Pin header 2.54 mm",
         lib="Connector_PinHeader_2.54mm:PinHeader_1x{n}_P2.54mm_Vertical",
+        lib_h="Connector_PinHeader_2.54mm:PinHeader_1x{n}_P2.54mm_Horizontal",
         lib_smd="Connector_PinHeader_2.54mm:"
                 "PinHeader_1x{n}_P2.54mm_Vertical_SMD_Pin1Left",
         order=["Generic male pin header, 1x{n}, 2.54 mm pitch, {mount}",
@@ -105,16 +106,18 @@ CONNECTORS = {
         kind="tht", pitch=2.50, pad=1.8, drill=1.0,
         label="JST XH (B{n}B-XH-A)",
         lib="Connector_JST:JST_XH_B{n}B-XH-A_1x{n}_P2.50mm_Vertical",
-        order=["JST XH top-entry shrouded header, MPN: B{n}B-XH-A",
+        lib_h="Connector_JST:JST_XH_S{n}B-XH-A_1x{n}_P2.50mm_Horizontal",
+        order=["JST XH shrouded header, MPN: {bs}{n}B-XH-A",
                "  {n} pins, 2.50 mm pitch, {mount}",
                "  Mates with: XHP-{n} housing + SXH-001T-P0.6 crimp contacts"]),
     "jst-ph": dict(
         kind="tht", pitch=2.00, pad=1.3, drill=0.75,
         label="JST PH (B{n}B-PH-K)",
         lib="Connector_JST:JST_PH_B{n}B-PH-K_1x{n}_P2.00mm_Vertical",
+        lib_h="Connector_JST:JST_PH_S{n}B-PH-K_1x{n}_P2.00mm_Horizontal",
         lib_smd="Connector_JST:JST_PH_B{n}B-PH-SM4-TB_1x{n}-1MP_P2.00mm_Vertical",
-        order=["JST PH top-entry header, MPN: B{n}B-PH-K "
-               "(SMD variant: B{n}B-PH-SM4-TB)",
+        order=["JST PH header, MPN: {bs}{n}B-PH-K "
+               "(SMD variant: {bs}{n}B-PH-SM4-TB)",
                "  {n} pins, 2.00 mm pitch, {mount}",
                "  Mates with: PHR-{n} housing + SPH-002T-P0.5S crimp contacts"]),
     "zif": dict(
@@ -300,15 +303,17 @@ class Gen:
                          "(discover names with --list-connectors)")
             self._load_lib_connector(a.connector_footprint, flip)
         elif a.connector != "zif" and not a.connector_pitch:
-            tpl = self.conn.get("lib_smd" if a.connector_mount == "smd"
-                                else "lib")
+            key = ("lib" + ("_smd" if a.connector_mount == "smd" else "")
+                   + ("_h" if a.connector_angle == "horizontal" else ""))
+            tpl = self.conn.get(key)
             spec = tpl.format(n=self.n_pads) if tpl else None
             if spec and lib_exists(spec) and KICAD["python"]:
                 self._load_lib_connector(spec, flip)
             else:
                 self.warnings.append(
-                    f"{spec or a.connector + ' (SMD)'} not in KiCad library "
-                    "(or pcbnew unavailable); using a generated footprint")
+                    f"{spec or a.connector + ' ' + a.connector_mount + ' ' + a.connector_angle} "
+                    "not in KiCad library (or pcbnew unavailable); "
+                    "using a generated footprint")
                 if a.connector_mount == "smd":
                     self.conn["kind"] = "smd"
         elif a.connector_pitch and a.connector != "zif":
@@ -806,8 +811,9 @@ class Gen:
                 y=self.pad_y - self._lib_ymid, rot=self.lib_rot,
                 flip=self.lib_flip, ref="J1",
                 ref_at=[self.conn_cx,
-                        self.pad_y + self.libbox[0] - self._lib_ymid
-                        - (2.8 if self.lib_flip else 1.4)],
+                        max(self.pad_y + self.libbox[0] - self._lib_ymid
+                            - (2.8 if self.lib_flip else 1.4),
+                            self.arr_b + MASK_M + 1.0)],  # keep out of window
                 nets={p["num"]: nets[i][1] for i, p in enumerate(self.libpads)
                       if nets[i]}))
             self.pin_labels()
@@ -952,13 +958,17 @@ class Gen:
                 n=n, pitch=self.conn["pitch"], fp=self.lib_spec or "",
                 mount=("surface-mount" if a.connector_mount == "smd"
                        else "through-hole"),
+                bs="S" if a.connector_angle == "horizontal" else "B",
                 contacts=cdesc.get(getattr(self, "tail_contacts", ""), "")))
         if a.connector != "zif":
-            L.append(f"  Mounted on the "
+            L.append(f"  {a.connector_angle.capitalize()}"
+                     + (" (right-angle, side entry)"
+                        if a.connector_angle == "horizontal" else " (top entry)")
+                     + f", mounted on the "
                      f"{'TOP' if self.conn_side == 'top' else 'BACK'} "
                      "side of the board"
                      + ("" if a.connector_mount == "smd" else
-                        " (through-hole: insert from that side)"))
+                        "; through-hole: insert from that side"))
         if self.lib_spec:
             L.append(f"  KiCad footprint used: {self.lib_spec}"
                      + (f" (rotated {self.lib_rot} deg)" if self.lib_rot else ""))
@@ -1144,6 +1154,10 @@ def main():
     o.add_argument("--connector-mount", choices=["tht", "smd"], default="tht",
                    help="through-hole or surface-mount connector variant "
                         "(non-ZIF; default tht)")
+    o.add_argument("--connector-angle", choices=["vertical", "horizontal"],
+                   default="vertical",
+                   help="vertical (top entry) or horizontal / right-angle "
+                        "(side entry) connector (non-ZIF; default vertical)")
     o.add_argument("--connector-footprint", metavar="LIB:NAME")
     o.add_argument("--tail-len", type=float, default=6.0,
                    help="ZIF tail length mm (default 6, min 5)")

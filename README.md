@@ -100,6 +100,7 @@ Run `python3 fsr_array_gen.py --help` for the full option reference.
 | | `--fixed-pins` | always 16 pins: 1–8 = rows, 9–16 = columns, unused = NC — one cable/readout board fits any array up to 8×8 (ZIF pitch defaults to 1.25 mm) |
 | | `--connector-pitch` | override the connector's default pitch, mm |
 | | `--connector-mount {tht,smd}` | through-hole or surface-mount connector variant (default tht) |
+| | `--connector-angle {vertical,horizontal}` | vertical (top entry) or right-angle (side entry) connector (default vertical) |
 | | `--contacts {top,bottom,both}` | ZIF: which tail face(s) carry fingers. Other connectors: which side of the board the connector mounts on. Default top |
 | | `--connector-footprint LIB:NAME` | required with `--connector lib` |
 | | `--tail-len` | ZIF/FFC tail length, mm (default 6, min 5) |
