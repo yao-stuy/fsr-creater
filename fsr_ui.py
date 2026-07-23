@@ -162,6 +162,11 @@ a.dl { color:var(--acc); }
     </div>
     <div class="row">
       <div class="f"><label>Project name</label><input name="name" placeholder="fsr_RxC"></div>
+      <div class="f"><label>Pinout</label>
+        <select name="fixed_pins">
+          <option value="">rows+cols pins</option>
+          <option value="1">fixed 16-pin (NC-padded)</option>
+        </select></div>
     </div>
   </fieldset>
   <button id="go" onclick="create()">Create KiCad project</button>
@@ -253,6 +258,8 @@ def run_gen(data):
              "--hole-size", data.get("hole_size", "m3")]
     if data.get("connector") == "lib" and data.get("connector_footprint"):
         args += ["--connector-footprint", data["connector_footprint"]]
+    if data.get("fixed_pins"):
+        args += ["--fixed-pins"]
     r = subprocess.run(args, capture_output=True, text=True, cwd=HERE, timeout=300)
     out = "$ " + " ".join(a if " " not in a else repr(a) for a in args[2:]) + "\n\n"
     out += r.stdout + (("\n" + r.stderr) if r.stderr.strip() else "")

@@ -97,6 +97,7 @@ Run `python3 fsr_array_gen.py --help` for the full option reference.
 | | `--board-w`, `--board-h` | edge-cut outline; if given without sensor dims, the sensing area stretches to fill the board |
 | Style | `--style {pcb,fpc}` | rigid PCB (1.6 mm) or flex FPC (0.13 mm) |
 | Connector | `--connector {tht,jst-xh,jst-ph,zif,lib}` | connector type; resolved to a real KiCad library footprint when available |
+| | `--fixed-pins` | always 16 pins: 1–8 = rows, 9–16 = columns, unused = NC — one cable/readout board fits any array up to 8×8 (ZIF pitch defaults to 1.25 mm) |
 | | `--connector-pitch` | override the connector's default pitch, mm |
 | | `--connector-footprint LIB:NAME` | required with `--connector lib` |
 | | `--tail-len` | ZIF/FFC tail length, mm (default 6, min 5) |

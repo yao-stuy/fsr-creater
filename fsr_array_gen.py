@@ -235,7 +235,12 @@ class Gen:
     def resolve_geometry(self):
         a = self.a
         R, C = a.rows, a.cols
-        self.n_pads = R + C
+        # fixed mode: always a 16-pin connector (pins 1-8 rows, 9-16 cols,
+        # unused positions NC) so one cable/readout fits any array size
+        if a.fixed_pins and (R > 8 or C > 8):
+            sys.exit("--fixed-pins supports up to 8x8")
+        self.n_pads = 16 if a.fixed_pins else R + C
+        self.col_pad0 = 8 if a.fixed_pins else R
 
         # --- auto-optimal comb / sensel parameters (explicit values win) ---
         a.trace = a.trace or DEF_TRACE
@@ -260,6 +265,8 @@ class Gen:
         self.conn = dict(CONNECTORS[a.connector])
         if a.connector_pitch:
             self.conn["pitch"] = a.connector_pitch
+        elif a.fixed_pins and a.connector == "zif":
+            self.conn["pitch"] = 1.25    # common 16-way FFC pitch
         self.lib_spec, self.lib_rot, self.libpads, self.libbox = None, 0, None, None
         if a.connector == "lib":
             if not a.connector_footprint:
@@ -325,7 +332,17 @@ class Gen:
         self.arr_h = (R - 1) * self.pitch_y + self.sensel_h
 
         # --- board + array position ---
-        self.board_w = a.board_w or (self.arr_w + 2 * side_need)
+        # the board must also be wide enough for the connector / tail
+        if a.connector == "zif":
+            conn_need = (a.tail_w or (self.n_pads + 1) * self.conn["pitch"]) + 2.4
+        elif self.libpads:
+            conn_need = (self.libbox[3] - self.libbox[2]) + 2.4
+        else:
+            conn_need = (self.n_pads - 1) * self.conn["pitch"] + 4.4
+        self.board_w = a.board_w or max(self.arr_w + 2 * side_need, conn_need)
+        if self.board_w < conn_need - 1e-6:
+            sys.exit(f"board width {self.board_w} mm too narrow for the "
+                     f"connector; need >= {conn_need:.1f} mm")
         self.arr_x = (self.board_w - self.arr_w) / 2
         if self.arr_x < side_need - 1e-6:
             sys.exit(f"board width {self.board_w} mm leaves {self.arr_x:.1f} mm "
@@ -359,7 +376,7 @@ class Gen:
 
         # --- column fan grouping / bands ---
         self.col_left = [c for c in range(C)
-                         if self.bus_x(c) <= self.pad_xs[R + c]]
+                         if self.bus_x(c) <= self.pad_xs[self.col_pad0 + c]]
         nl, nr = len(self.col_left), C - len(self.col_left)
         col_levels = max(nl, nr)
         self.col_top = self.arr_b + MASK_M + BAND_GAP
@@ -534,7 +551,7 @@ class Gen:
         fan_layer = "B.Cu" if self.fine_zif else "F.Cu"
         for c in range(C):
             xb = self.bus_x(c)
-            px = self.pad_xs[R + c]
+            px = self.pad_xs[self.col_pad0 + c]
             if c in self.col_left:
                 y_fan = self.col_deep - self.col_left.index(c) * COL_STEP
             else:
@@ -544,7 +561,8 @@ class Gen:
             if not self.fine_zif:
                 self.via(xb, y_fan, self.cnet(c))
             self.seg(xb, y_fan, px, y_fan, fan_layer, self.cnet(c), self.drop_w)
-            self.drop_to_pad(px, y_fan, self.cnet(c), R + c, from_layer=fan_layer)
+            self.drop_to_pad(px, y_fan, self.cnet(c), self.col_pad0 + c,
+                             from_layer=fan_layer)
 
         # 3. row escapes: top half left, bottom half right (B.Cu) --
         for r in range(R):
@@ -658,8 +676,22 @@ class Gen:
                 self.seg(px, yv, px, pad_y, other, net, w)
 
     def pad_names(self):
-        return ([f"ROW{r + 1}" for r in range(self.a.rows)]
-                + [f"COL{c + 1}" for c in range(self.a.cols)])
+        """Net name per pad; '' = NC (fixed mode's unused positions)."""
+        names = [""] * self.n_pads
+        for r in range(self.a.rows):
+            names[r] = f"ROW{r + 1}"
+        for c in range(self.a.cols):
+            names[self.col_pad0 + c] = f"COL{c + 1}"
+        return names
+
+    def pad_nets(self):
+        """(net number, net name) per pad, or None for NC positions."""
+        nets = [None] * self.n_pads
+        for r in range(self.a.rows):
+            nets[r] = (self.rnet(r), f"ROW{r + 1}")
+        for c in range(self.a.cols):
+            nets[self.col_pad0 + c] = (self.cnet(c), f"COL{c + 1}")
+        return nets
 
     def pin_labels(self):
         """R1..Rn / C1..Cn silk labels near the connector, on the back."""
@@ -668,14 +700,13 @@ class Gen:
         ly = self.pad_y + 2.6
         if ly > self.board_h - 0.9:
             ly = self.pad_y - 2.6
-        R = self.a.rows
-        for i in range(self.n_pads):
-            lbl = f"R{i + 1}" if i < R else f"C{i - R + 1}"
+        for i, name in enumerate(self.pad_names()):
+            lbl = name.replace("ROW", "R").replace("COL", "C") or "NC"
             self.text(lbl, self.pad_xs[i], ly, "B.SilkS", 0.8)
 
     def make_connector(self):
         a = self.a
-        names = self.pad_names()
+        nets = self.pad_nets()
         kind = self.conn["kind"]
         if kind == "lib":
             xs = [p["x"] for p in self.libpads]
@@ -683,7 +714,8 @@ class Gen:
             self.lib_adds.append(dict(
                 spec=self.lib_spec, x=self.conn_cx - cx,
                 y=self.pad_y - self._lib_ymid, rot=self.lib_rot, ref="J1",
-                nets={p["num"]: names[i] for i, p in enumerate(self.libpads)}))
+                nets={p["num"]: nets[i][1] for i, p in enumerate(self.libpads)
+                      if nets[i]}))
             self.pin_labels()
         elif kind == "tht":
             pads = [dict(num=str(i + 1), ptype="thru_hole",
@@ -691,7 +723,7 @@ class Gen:
                          px=self.pad_dx[i] - self.pad_dx[0], py=0,
                          sx=self.conn["pad"], sy=self.conn["pad"],
                          drill=self.conn["drill"], layers='"*.Cu" "*.Mask"',
-                         net=(i + 1, names[i])) for i in range(self.n_pads)]
+                         net=nets[i]) for i in range(self.n_pads)]
             self.gen_footprint(
                 f"{a.connector}_1x{self.n_pads}", "F.Cu", "through_hole",
                 [("reference", "J1", -self.pad_dx[0], -4.2, "B.SilkS"),
@@ -704,7 +736,7 @@ class Gen:
             pads = [dict(num=str(i + 1), ptype="smd", shape="rect",
                          px=self.pad_dx[i] - self.pad_dx[0], py=0,
                          sx=round(pw, 3), sy=3.0, layers='"B.Cu" "B.Mask"',
-                         net=(i + 1, names[i])) for i in range(self.n_pads)]
+                         net=nets[i]) for i in range(self.n_pads)]
             self.gen_footprint(
                 f"zif_tail_1x{self.n_pads}_P{self.conn['pitch']}mm", "B.Cu",
                 "exclude_from_pos_files",
@@ -712,7 +744,8 @@ class Gen:
                  ("value", f"ZIF tail P{self.conn['pitch']}mm",
                   -self.pad_dx[0], -5.2, "B.Fab")],
                 pads, self.pad_xs[0], self.pad_y)
-            if a.style == "fpc":
+            if (a.style == "fpc"
+                    and self.board_h - 1.6 > self.arr_b + MASK_M + 2.4):
                 self.text(f"stiffener {0.30 - 0.13:.2f}mm on FRONT of tail",
                           self.conn_cx, self.board_h - 1.6, "B.SilkS", 0.8)
 
@@ -784,8 +817,12 @@ class Gen:
              f"Combs:      {a.trace:.3f} mm trace / {a.gap:.3f} mm gap "
              f"({a.trace * 1000 / 25.4:.0f}/{a.gap * 1000 / 25.4:.0f} mil), "
              f"{self.n_fingers} fingers per sensel", "",
-             f"Connector J1 ({n} positions: pins 1-{a.rows} = rows, "
-             f"{a.rows + 1}-{n} = columns):"]
+             f"Connector J1 ({n} positions: "
+             + (f"FIXED pinout - pins 1-8 = rows (1-{a.rows} used, rest NC), "
+                f"9-16 = columns (1-{a.cols} used, rest NC)"
+                if a.fixed_pins else
+                f"pins 1-{a.rows} = rows, {a.rows + 1}-{n} = columns")
+             + "):"]
         for line in self.conn.get("order", []):
             L.append("  " + line.format(n=n, pitch=self.conn["pitch"],
                                         fp=self.lib_spec or ""))
@@ -963,6 +1000,10 @@ def main():
                    help="ZIF tail width mm (default: standard FFC width "
                         "= (n_pins+1) x pitch, so it fits a standard socket)")
     o.add_argument("--list-connectors", metavar="PATTERN", nargs="?", const="")
+    o.add_argument("--fixed-pins", action="store_true",
+                   help="always use a 16-pin connector (pins 1-8 rows, 9-16 "
+                        "cols, unused = NC) so one cable/readout board fits "
+                        "any array size up to 8x8; ZIF pitch defaults to 1.25")
     o.add_argument("--mounting-holes", choices=["auto", "on", "off"], default="auto")
     o.add_argument("--no-mounting-holes", dest="mounting_holes",
                    action="store_const", const="off")
