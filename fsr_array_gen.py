@@ -114,7 +114,7 @@ CONNECTORS = {
                "  {n} pins, 2.00 mm pitch, through-hole",
                "  Mates with: PHR-{n} housing + SPH-002T-P0.5S crimp contacts"]),
     "zif": dict(
-        kind="zif", pitch=1.00, pad=0.55, drill=0,
+        kind="zif", pitch=1.25, pad=0.55, drill=0,
         label="FFC/FPC tail for ZIF socket",
         order=["FFC/FPC tail: {n} contacts, {pitch} mm pitch, "
                "contacts: {contacts}",
@@ -263,8 +263,6 @@ class Gen:
         self.conn = dict(CONNECTORS[a.connector])
         if a.connector_pitch:
             self.conn["pitch"] = a.connector_pitch
-        elif a.fixed_pins and a.connector == "zif":
-            self.conn["pitch"] = 1.25    # common 16-way FFC pitch
         self.lib_spec, self.lib_rot, self.libpads, self.libbox = None, 0, None, None
         if a.connector == "lib":
             if not a.connector_footprint:
@@ -1034,15 +1032,16 @@ def main():
     o.add_argument("--tail-w", type=float,
                    help="ZIF tail width mm (default: standard FFC width "
                         "= (n_pins+1) x pitch, so it fits a standard socket)")
-    o.add_argument("--tail-contacts", choices=["both", "bottom", "top"],
-                   default="both",
+    o.add_argument("--tail-contacts", choices=["top", "bottom", "both"],
+                   default="top",
                    help="which face(s) of the ZIF tail carry contacts "
-                        "(default both: either socket style works)")
+                        "(default top: sensor face-up into a top-contact "
+                        "socket; 'both' works with either socket style)")
     o.add_argument("--list-connectors", metavar="PATTERN", nargs="?", const="")
     o.add_argument("--fixed-pins", action="store_true",
                    help="always use a 16-pin connector (pins 1-8 rows, 9-16 "
                         "cols, unused = NC) so one cable/readout board fits "
-                        "any array size up to 8x8; ZIF pitch defaults to 1.25")
+                        "any array size up to 8x8")
     o.add_argument("--mounting-holes", choices=["auto", "on", "off"], default="auto")
     o.add_argument("--no-mounting-holes", dest="mounting_holes",
                    action="store_const", const="off")
