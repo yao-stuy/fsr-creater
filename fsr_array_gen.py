@@ -650,16 +650,14 @@ class Gen:
             f'(layer "F.Mask") (uuid "{uid()}"))')
         self.make_outline()
 
+        # title goes on the BACK, centered under the array: the front is all
+        # sensing window, but the back there is only masked bus copper
         title = (f"FSR {R}x{C} {a.trace * 1000 / 25.4:.0f}/"
                  f"{a.gap * 1000 / 25.4:.0f} mil {a.style.upper()} ENIG")
-        room = self.arr_y - MASK_M                    # space above mask opening
-        avail_w = self.board_w - 2 * ((self.hole_off + self.hole_d / 2 + 0.5)
-                                      if self.holes else 1.5)
-        size = min(1.4, room - 1.0, avail_w / (len(title) * 0.95))
-        if room >= 2.0 and size >= 0.8:
-            self.text(title, self.board_w / 2, room / 2, "B.SilkS", size)
-        else:
-            self.warnings.append("no room above sensing area; title omitted")
+        size = min(1.4, (self.arr_w - 4) / (len(title) * 0.95))
+        if size >= 0.8:
+            self.text(title, (self.arr_x + self.arr_r) / 2,
+                      self.arr_y + self.arr_h / 2, "B.SilkS", size)
         for r in range(R):
             self.text(str(r + 1), self.arr_x - MASK_M - 1.2,
                       self.arr_y + r * self.pitch_y + self.sensel_h / 2, "B.SilkS", 1.0)
@@ -724,7 +722,18 @@ class Gen:
         return nets
 
     def pin_labels(self):
-        """R1..Rn / C1..Cn silk labels near the connector, on the back."""
+        """Pin labels near the connector, on the back silkscreen."""
+        if self.conn["kind"] == "zif":
+            # pin numbers beside the tail fingers, staggered in two rows so
+            # they fit fine pitches; placed clear of any back-side pads
+            if self.tail_contacts == "top":
+                y_hi = self.board_h + 1.1        # back of tab is bare
+            else:
+                y_hi = self.pad_y - 3.6          # stay above exposed fingers
+            for i in range(self.n_pads):
+                self.text(str(i + 1), self.pad_xs[i],
+                          y_hi if i % 2 == 0 else y_hi + 1.2, "B.SilkS", 0.8)
+            return
         if self.conn_pitch_min < 1.8:        # too fine to label per pin
             return
         ly = self.pad_y + 2.6
@@ -778,13 +787,15 @@ class Gen:
             self.gen_footprint(
                 f"zif_tail_1x{self.n_pads}_P{self.conn['pitch']}mm_{tc}", "B.Cu",
                 "exclude_from_pos_files",
-                [("reference", "J1", -self.pad_dx[0], -3.4, "B.SilkS"),
+                [("reference", "J1", -self.pad_dx[0], -3.4, "B.Fab"),
                  ("value", f"ZIF tail P{self.conn['pitch']}mm",
                   -self.pad_dx[0], -5.2, "B.Fab")],
                 pads, self.pad_xs[0], self.pad_y)
+            self.pin_labels()
             if (a.style == "fpc"
                     and self.board_h - 1.6 > self.arr_b + MASK_M + 2.4):
-                self.text(f"stiffener {0.30 - 0.13:.2f}mm on FRONT of tail",
+                side = "BACK" if self.tail_contacts == "top" else "FRONT"
+                self.text(f"stiffener {0.30 - 0.13:.2f}mm on {side} of tail",
                           self.conn_cx, self.board_h - 1.6, "B.SilkS", 0.8)
 
     def make_outline(self):
