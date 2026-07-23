@@ -776,7 +776,9 @@ class Gen:
              + (f" + {self.tail_len:.1f} mm tail" if a.connector == "zif" else "")
              + f", 2-layer, {'0.13 mm polyimide flex' if a.style == 'fpc' else '1.6 mm FR-4'}",
              "Finish:     ENIG (REQUIRED - the sensing copper stays exposed;",
-             "            HASL/bare copper will oxidize and drift)",
+             "            HASL/bare copper will oxidize and drift).",
+             "            NOTE: surface finish is NOT encoded in gerbers -",
+             "            select 'ENIG' at the fab's order page.",
              f"Sensing:    {self.arr_w:.1f} x {self.arr_h:.1f} mm window, "
              f"{a.rows}x{a.cols} sensels @ {self.pitch_x:.2f} x {self.pitch_y:.2f} mm pitch",
              f"Combs:      {a.trace:.3f} mm trace / {a.gap:.3f} mm gap "
@@ -918,10 +920,12 @@ def export_outputs(folder, name):
                        capture_output=True)
     gdir = os.path.join(folder, "gerbers")
     os.makedirs(gdir, exist_ok=True)
-    subprocess.run([cli, "pcb", "export", "gerbers", "--output", gdir + "/", pcb],
-                   capture_output=True)
-    subprocess.run([cli, "pcb", "export", "drill", "--output", gdir + "/", pcb],
-                   capture_output=True)
+    subprocess.run([cli, "pcb", "export", "gerbers", "--layers",
+                    "F.Cu,B.Cu,F.Mask,B.Mask,F.Paste,B.Paste,"
+                    "F.Silkscreen,B.Silkscreen,Edge.Cuts",
+                    "--output", gdir + "/", pcb], capture_output=True)
+    subprocess.run([cli, "pcb", "export", "drill", "--excellon-separate-th",
+                    "--output", gdir + "/", pcb], capture_output=True)
     shutil.make_archive(os.path.join(folder, f"{name}_gerbers"), "zip", gdir)
 
 
@@ -948,7 +952,8 @@ def main():
     d.add_argument("--board-w", type=float, help="edge-cut width")
     d.add_argument("--board-h", type=float, help="edge-cut height")
     o = ap.add_argument_group("options")
-    o.add_argument("--style", choices=["pcb", "fpc"], default="pcb")
+    o.add_argument("--style", choices=["pcb", "fpc"],
+                   help="default: fpc when --connector zif, else pcb")
     o.add_argument("--connector", choices=list(CONNECTORS), default="tht")
     o.add_argument("--connector-pitch", type=float)
     o.add_argument("--connector-footprint", metavar="LIB:NAME")
@@ -969,6 +974,8 @@ def main():
     if a.list_connectors is not None:
         list_connectors(a.list_connectors)
         return
+    if not a.style:      # ZIF tails must flex into the socket -> FPC
+        a.style = "fpc" if a.connector == "zif" else "pcb"
 
     name = a.name or f"fsr_{a.rows}x{a.cols}"
     folder = os.path.join(a.outdir, name)

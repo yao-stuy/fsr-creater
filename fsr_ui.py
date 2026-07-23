@@ -173,8 +173,10 @@ a.dl { color:var(--acc); }
 </main>
 <script>
 function libToggle(){
-  const on = document.querySelector('[name=connector]').value === 'lib';
-  document.getElementById('libbox').style.display = on ? 'block' : 'none';
+  const conn = document.querySelector('[name=connector]').value;
+  document.getElementById('libbox').style.display = conn === 'lib' ? 'block' : 'none';
+  if (conn === 'zif')  // a ZIF tail must flex into the socket
+    document.querySelector('[name=style]').value = 'fpc';
 }
 let t = null;
 function libSearch(){
