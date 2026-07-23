@@ -29,7 +29,7 @@ FLAGS = {
     "sensor_w": "--sensor-w", "sensor_h": "--sensor-h",
     "board_w": "--board-w", "board_h": "--board-h",
     "connector_pitch": "--connector-pitch", "tail_len": "--tail-len",
-    "name": "--name",
+    "tail_w": "--tail-w", "name": "--name",
 }
 
 PAGE = """<!doctype html>
@@ -146,6 +146,8 @@ a.dl { color:var(--acc); }
         <input name="connector_pitch" placeholder="default"></div>
       <div class="f"><label>ZIF tail len mm</label>
         <input name="tail_len" placeholder="6.0"></div>
+      <div class="f"><label>ZIF tail width mm</label>
+        <input name="tail_w" placeholder="std"></div>
     </div>
     <div id="libbox">
       <div class="row"><div class="f">

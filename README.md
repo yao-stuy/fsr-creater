@@ -100,6 +100,7 @@ Run `python3 fsr_array_gen.py --help` for the full option reference.
 | | `--connector-pitch` | override the connector's default pitch, mm |
 | | `--connector-footprint LIB:NAME` | required with `--connector lib` |
 | | `--tail-len` | ZIF/FFC tail length, mm (default 6, min 5) |
+| | `--tail-w` | ZIF/FFC tail width, mm (default: standard FFC width `(n+1)×pitch`, so it fits a standard ZIF slot) |
 | | `--list-connectors PATTERN` | search KiCad's footprint library (space-separated terms, all must match) |
 | Mounting | `--mounting-holes {auto,on,off}` | 4 NPTH corner holes (auto = on for PCB, off for FPC) |
 | | `--hole-size {m2,m2.5,m3,m4}` | screw size for the mounting holes (default M3) |

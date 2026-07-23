@@ -371,11 +371,37 @@ class Gen:
         # --- connector y / board height ---
         self.drop_gap = (max(2.6, self.hole_d / 2 + 1.15)
                          if self.holes else 2.6)
+        self.edge_rule = None
         if a.connector == "zif":
             self.tail_len = max(a.tail_len, 5.0)
             if self.tail_len != a.tail_len:
                 self.warnings.append("tail length clamped to 5.0 mm minimum")
-            self.tab_w = (self.n_pads - 1) * self.conn["pitch"] + 5.0
+            p = self.conn["pitch"]
+            span = (self.n_pads - 1) * p               # outer pad centers
+            std_w = (self.n_pads + 1) * p              # JIS-standard FFC width
+            min_w = span + 2 * (p * 0.55 / 2 + 0.25)   # pads + copper margin
+            self.tab_w = a.tail_w or std_w
+            if self.tab_w < min_w:
+                self.warnings.append(f"tail width raised to {min_w:.2f} mm "
+                                     "minimum (pad clearance)")
+                self.tab_w = min_w
+            if self.tab_w > std_w + 0.3:
+                self.warnings.append(
+                    f"tail width {self.tab_w:.1f} mm exceeds the standard "
+                    f"{std_w:.1f} mm slot of a {self.n_pads}-pos {p} mm ZIF "
+                    "socket — check your socket's datasheet")
+            # standard-width tails put the outer finger closer to the edge
+            # than KiCad's 0.5 mm default rule; real FFC tails do this by
+            # design, so relax the board's copper-to-edge rule (declared in
+            # the .kicad_pro, reported in ORDER_INFO — not hidden)
+            edge_cl = (self.tab_w - span) / 2 - p * 0.55 / 2
+            self.edge_rule = round(max(0.2, edge_cl - 0.05), 2) \
+                if edge_cl < 0.55 else None
+            if a.style != "fpc":
+                self.warnings.append(
+                    "ZIF tail on a 1.6 mm rigid board cannot insert into a "
+                    "ZIF socket (needs ~0.30 mm) — use --style fpc, or order "
+                    "controlled-depth milling for the tail")
             tail = 0.0
             min_h = self.row_deep + 1.5      # body hugs the routing: no
         else:                                # empty strip before the tail
@@ -686,6 +712,9 @@ class Gen:
                  ("value", f"ZIF tail P{self.conn['pitch']}mm",
                   -self.pad_dx[0], -5.2, "B.Fab")],
                 pads, self.pad_xs[0], self.pad_y)
+            if a.style == "fpc":
+                self.text(f"stiffener {0.30 - 0.13:.2f}mm on FRONT of tail",
+                          self.conn_cx, self.board_h - 1.6, "B.SilkS", 0.8)
 
     def make_outline(self):
         w, h = self.board_w, self.board_h
@@ -761,6 +790,39 @@ class Gen:
         if self.lib_spec:
             L.append(f"  KiCad footprint used: {self.lib_spec}"
                      + (f" (rotated {self.lib_rot} deg)" if self.lib_rot else ""))
+        if a.connector == "zif":
+            p = self.conn["pitch"]
+            th = 0.13 if a.style == "fpc" else 1.6
+            L += ["",
+                  "Mating ZIF socket (this goes on your READOUT board, "
+                  "not the sensor):",
+                  f"  {n}-position, {p} mm pitch, BOTTOM-contact, horizontal "
+                  "FFC/FPC ZIF socket",
+                  f"  Tail dimensions: {self.tab_w:.1f} mm wide x "
+                  f"{self.tail_len:.1f} mm long "
+                  f"(standard slot width for {n}p/{p} mm: "
+                  f"{(n + 1) * p:.1f} mm)",
+                  "  Insertion thickness must be 0.30 mm total: board is "
+                  f"{th} mm -> add a {max(0.30 - th, 0):.2f} mm stiffener "
+                  "(polyimide/FR4) on the FRONT of the tail",
+                  "  Typical insertion depth ~4 mm; ENIG finish on the "
+                  "fingers (same order as the board)"]
+            if self.edge_rule:
+                L.append(f"  NOTE: board copper-to-edge rule set to "
+                         f"{self.edge_rule} mm on the tail (standard for "
+                         "FFC fingers; KiCad default is 0.5 mm)")
+            sugg = []
+            if KICAD["fplib"]:
+                lib = os.path.join(KICAD["fplib"], "Connector_FFC-FPC.pretty")
+                pats = {f"P{p:g}mm", f"P{p:.1f}mm", f"P{p:.2f}mm"}
+                for m in sorted(glob.glob(os.path.join(lib, "*.kicad_mod"))):
+                    nm = os.path.splitext(os.path.basename(m))[0]
+                    if (f"1x{n}" in nm and "Horizontal" in nm
+                            and any(t in nm for t in pats)):
+                        sugg.append(nm)
+            if sugg:
+                L.append("  KiCad footprints for the readout board side:")
+                L += [f"    Connector_FFC-FPC:{s}" for s in sugg[:4]]
         L.append("")
         if self.holes:
             d = self.hole_d
@@ -892,6 +954,9 @@ def main():
     o.add_argument("--connector-footprint", metavar="LIB:NAME")
     o.add_argument("--tail-len", type=float, default=6.0,
                    help="ZIF tail length mm (default 6, min 5)")
+    o.add_argument("--tail-w", type=float,
+                   help="ZIF tail width mm (default: standard FFC width "
+                        "= (n_pins+1) x pitch, so it fits a standard socket)")
     o.add_argument("--list-connectors", metavar="PATTERN", nargs="?", const="")
     o.add_argument("--mounting-holes", choices=["auto", "on", "off"], default="auto")
     o.add_argument("--no-mounting-holes", dest="mounting_holes",
@@ -914,8 +979,12 @@ def main():
     pcb = os.path.join(folder, f"{name}.kicad_pcb")
     with open(pcb, "w") as f:
         f.write(gen.board_text())
+    pro = {"meta": {"filename": f"{name}.kicad_pro", "version": 3}}
+    if gen.edge_rule:
+        pro["board"] = {"design_settings": {
+            "rules": {"min_copper_edge_clearance": gen.edge_rule}}}
     with open(os.path.join(folder, f"{name}.kicad_pro"), "w") as f:
-        json.dump({"meta": {"filename": f"{name}.kicad_pro", "version": 3}}, f, indent=2)
+        json.dump(pro, f, indent=2)
 
     if gen.gen_lib:
         # project-local footprint library so 'FSR:*' footprints resolve
