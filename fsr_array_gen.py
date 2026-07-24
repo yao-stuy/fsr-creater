@@ -280,7 +280,9 @@ class Gen:
         if a.fixed_pins and (R > 8 or C > 8):
             sys.exit("--fixed-pins supports up to 8x8")
         self.n_pads = 16 if a.fixed_pins else R + C
-        self.col_pad0 = 8 if a.fixed_pins else R
+        # pinout: columns first (pins 1..C), rows second (pins C+1..)
+        self.col_pad0 = 0
+        self.row_pad0 = 8 if a.fixed_pins else C
         self.c_rows = a.connector_rows
         if self.c_rows > 1:
             if a.connector == "zif":
@@ -379,12 +381,13 @@ class Gen:
         # --- side margins: row escapes split left/right ---
         # Fine-pitch (<0.9 mm) ZIF: vias can't fit between the drop columns,
         # so columns must reach the B.Cu fingers without a layer change.
-        # Routing ALL rows out the left keeps the right half of B.Cu free of
-        # row copper, so column traces can stay on B.Cu end to end.
+        # Routing ALL rows out the right keeps the left half of B.Cu free
+        # (cols = pins 1..C = left block), so columns stay on B.Cu.
         self.fine_zif = (a.connector == "zif" and self.conn["pitch"] < 0.9)
-        self.kL = R if self.fine_zif else (R + 1) // 2
+        self.kL = 0 if self.fine_zif else (R + 1) // 2
         self.kR = R - self.kL
-        side_need = EDGE_KEEP + VIA_OFF + max(self.kL - 1, 0) * STAG_R
+        side_need = (EDGE_KEEP + VIA_OFF
+                     + max(max(self.kL, self.kR) - 1, 0) * STAG_R)
         self.top_margin = (self.hole_off + self.hole_d / 2 + 2.4
                            if self.holes else MASK_M + 1.0)
 
@@ -500,18 +503,20 @@ class Gen:
                     self.drop_w = min(self.drop_w, wc)
                     break
             else:
-                # no room between columns: reach the far row FROM BELOW via
-                # an escape band between the far pads and the board edge.
-                # Needs the far row to be exactly the COL block (straight
-                # numbering) so one whole layer serves it via-free.
+                # no room between columns: columns take the near row
+                # directly, and the rows — already descending the side
+                # margins on B.Cu — wrap around the connector and enter the
+                # far row from below via a band between far pads and edge.
+                # Needs straight numbering so far row == ROW block.
                 far = max(self.pad_cy)
-                far_slots = [i for i in range(self.n_pads)
-                             if abs(self.pad_cy[i] - far) < 0.05]
-                col_block = list(range(self.col_pad0, self.col_pad0 + C))
+                far_slots = {i for i in range(self.n_pads)
+                             if abs(self.pad_cy[i] - far) < 0.05}
+                row_block = set(range(self.row_pad0, self.row_pad0 + R))
                 thru_ok = (not self.libpads
                            or all(p["thru"] for p in self.libpads))
                 if (a.connector_numbering == "straight" and thru_ok
-                        and set(col_block).issubset(set(far_slots))
+                        and self.row_pad0 == self.n_pads // 2
+                        and row_block.issubset(far_slots)
                         and self.conn["kind"] in ("tht", "lib")):
                     self.underband = True
                     self.pad_dx = list(self.pad_cdx)   # no between-col drops
@@ -521,7 +526,9 @@ class Gen:
                              f"at {self.colp2} mm column pitch leave no room "
                              "to reach the far row — try --connector-mount "
                              "smd, or --connector-numbering straight with a "
-                             "through-hole connector")
+                             "through-hole connector"
+                             + ("" if self.row_pad0 == self.n_pads // 2 else
+                                " and --fixed-pins (or a square array)"))
         # x-extent physically occupied by the connector (body, not just pads)
         if self.libpads:
             ox = self.conn_cx - ctr
@@ -529,40 +536,28 @@ class Gen:
         else:
             self.conn_ext = (min(self.pad_cxs) - 2.0, max(self.pad_cxs) + 2.0)
         if self.underband:
-            # escape lanes run down the right side, beyond both the
-            # connector body and the last column bus (all-left approach)
-            self.ub_w, self.ub_ls, self.ub_bs = 0.25, 0.65, 0.65
-            r0 = max(self.conn_ext[1] + 0.5, self.bus_x(C - 1) + 0.8)
-            self.ub_lane = [r0 + c * self.ub_ls for c in range(C)]
-            need_w = self.ub_lane[-1] + 0.8
-            if need_w > self.board_w + 1e-6:
-                if a.board_w:
-                    sys.exit(f"board width {a.board_w} mm too narrow for the "
-                             f"far-row escape lanes; need >= {need_w:.1f} mm")
-                if self._iterw < 4:
-                    self._extra_w += need_w - self.board_w
-                    self._iterw += 1
-                    return self.resolve_geometry()
-            self.conn_ext = (self.conn_ext[0],
-                             max(self.conn_ext[1], self.ub_lane[-1]))
+            self.ub_w, self.ub_bs = 0.25, 0.45
             if self.libpads:
                 far_off = self.lib_pad_bot - self._lib_ymid
             else:
                 far_off = max(self.pad_cy) + self.pad_sz2 / 2
             self.ub_band0 = far_off + 0.55       # first band level, rel pad_y
-            self.ub_tail = far_off + 0.55 + (C - 1) * self.ub_bs + 0.9
+            self.ub_tail = (far_off + 0.55
+                            + max(max(self.kL, self.kR) - 1, 0) * self.ub_bs
+                            + 0.9)
 
         # --- column fan grouping / bands ---
-        self.col_tx = (self.ub_lane if self.underband else
-                       [self.pad_xs[self.col_pad0 + c] for c in range(C)])
+        self.col_tx = [self.pad_xs[self.col_pad0 + c] for c in range(C)]
         self.col_left = [c for c in range(C)
                          if self.bus_x(c) <= self.col_tx[c]]
         nl, nr = len(self.col_left), C - len(self.col_left)
         col_levels = max(nl, nr)
         self.col_top = self.arr_b + MASK_M + BAND_GAP
         self.col_deep = self.col_top + max(col_levels - 1, 0) * COL_STEP
-        row_levels = max(self.kL, self.kR)
-        self.row_top = self.col_deep + BAND_GAP
+        # underband: rows bypass the fan region entirely (they wrap around
+        # the connector to the far row), so no row band is reserved
+        row_levels = 0 if self.underband else max(self.kL, self.kR)
+        self.row_top = self.col_deep + (BAND_GAP if row_levels else 0)
         self.row_deep = self.row_top + max(row_levels - 1, 0) * ROW_STEP
 
         # --- connector y / board height ---
@@ -802,27 +797,34 @@ class Gen:
             if not self.fine_zif:
                 self.via(xb, y_fan, self.cnet(c))
             self.seg(xb, y_fan, tx, y_fan, fan_layer, self.cnet(c), self.drop_w)
-            if self.underband:
-                # far row entered from below: F.Cu side lane down to a via,
-                # then the band and pad stub run on B.Cu (cross-layer, so
-                # deep lanes never conflict with shallower bands)
-                i = self.col_pad0 + c
-                net, w = self.cnet(c), self.ub_w
-                band_y = self.pad_y + self.ub_band0 + (C - 1 - c) * self.ub_bs
-                py = self.pad_y + self.pad_cy[i]
-                self.seg(tx, y_fan, tx, band_y, "F.Cu", net, w)
-                self.via(tx, band_y, net)
-                self.seg(tx, band_y, self.pad_cxs[i], band_y, "B.Cu", net, w)
-                self.seg(self.pad_cxs[i], band_y, self.pad_cxs[i], py,
-                         "B.Cu", net, w)
-            else:
-                self.drop_to_pad(tx, y_fan, self.cnet(c), self.col_pad0 + c,
-                                 from_layer=fan_layer)
+            self.drop_to_pad(tx, y_fan, self.cnet(c), self.col_pad0 + c,
+                             from_layer=fan_layer)
 
         # 3. row escapes: top half left, bottom half right (B.Cu) --
         for r in range(R):
             y_top = self.arr_y + r * self.pitch_y
-            px = self.pad_xs[r]
+            slot = self.row_pad0 + r
+            px = self.pad_xs[slot]
+            if self.underband:
+                # wrap around the connector: continue down the margin and
+                # enter the far row from a band below it (all B.Cu, no vias)
+                net, w = self.rnet(r), self.ub_w
+                if r < self.kL:                        # left: r=0 innermost
+                    x_v = self.arr_x - VIA_OFF - r * STAG_R
+                    band_y = self.pad_y + self.ub_band0 + r * self.ub_bs
+                    self.seg(self.arr_x, y_top, x_v, y_top, "F.Cu", self.rnet(r))
+                else:                                  # right: last innermost
+                    x_v = self.arr_r + VIA_OFF + (R - 1 - r) * STAG_R
+                    band_y = (self.pad_y + self.ub_band0
+                              + (R - 1 - r) * self.ub_bs)
+                    self.seg(self.arr_r, y_top, x_v, y_top, "F.Cu", self.rnet(r))
+                py = self.pad_y + self.pad_cy[slot]
+                self.via(x_v, y_top, net)
+                self.seg(x_v, y_top, x_v, band_y, "B.Cu", net, w)
+                self.seg(x_v, band_y, self.pad_cxs[slot], band_y, "B.Cu", net, w)
+                self.seg(self.pad_cxs[slot], band_y, self.pad_cxs[slot], py,
+                         "B.Cu", net, w)
+                continue
             if r < self.kL:                            # left side
                 i = r
                 x_v = self.arr_x - VIA_OFF - (self.kL - 1 - i) * STAG_R
@@ -836,7 +838,7 @@ class Gen:
             self.via(x_v, y_top, self.rnet(r))
             self.seg(x_v, y_top, x_v, y_fan, "B.Cu", self.rnet(r))
             self.seg(x_v, y_fan, px, y_fan, "B.Cu", self.rnet(r), self.drop_w)
-            self.drop_to_pad(px, y_fan, self.rnet(r), r, from_layer="B.Cu")
+            self.drop_to_pad(px, y_fan, self.rnet(r), slot, from_layer="B.Cu")
 
         # 4. connector --------------------------------------------
         self.make_connector()
@@ -845,7 +847,10 @@ class Gen:
         if self.holes:
             off = self.hole_off
             pts = [(off, off), (self.board_w - off, off)]
-            if self.a.connector != "zif":       # bottom pair flanks connector
+            if self.underband:
+                self.warnings.append("bottom mounting holes skipped: the "
+                                     "far-row escape band crosses that area")
+            elif self.a.connector != "zif":     # bottom pair flanks connector
                 bx0 = self.conn_ext[0] - (self.hole_half + 0.6)
                 bx1 = self.conn_ext[1] + (self.hole_half + 0.6)
                 # below the row fan band, above the board edge
@@ -977,19 +982,19 @@ class Gen:
     def pad_names(self):
         """Net name per pad; '' = NC (fixed mode's unused positions)."""
         names = [""] * self.n_pads
-        for r in range(self.a.rows):
-            names[r] = f"ROW{r + 1}"
         for c in range(self.a.cols):
             names[self.col_pad0 + c] = f"COL{c + 1}"
+        for r in range(self.a.rows):
+            names[self.row_pad0 + r] = f"ROW{r + 1}"
         return names
 
     def pad_nets(self):
         """(net number, net name) per pad, or None for NC positions."""
         nets = [None] * self.n_pads
-        for r in range(self.a.rows):
-            nets[r] = (self.rnet(r), f"ROW{r + 1}")
         for c in range(self.a.cols):
             nets[self.col_pad0 + c] = (self.cnet(c), f"COL{c + 1}")
+        for r in range(self.a.rows):
+            nets[self.row_pad0 + r] = (self.rnet(r), f"ROW{r + 1}")
         return nets
 
     def pin_labels(self):
@@ -1001,6 +1006,9 @@ class Gen:
                 y_hi = self.board_h + 1.1        # back of tab is bare
             else:
                 y_hi = self.pad_y - 3.6          # stay above exposed fingers
+            if self.conn["pitch"] < 0.8:         # numbers can't fit: mark
+                self.text("1", self.pad_xs[0], y_hi, "B.SilkS", 0.8)
+                return
             for i in range(self.n_pads):
                 self.text(str(i + 1), self.pad_xs[i],
                           y_hi if i % 2 == 0 else y_hi + 1.2, "B.SilkS", 0.8)
@@ -1169,10 +1177,10 @@ class Gen:
              f"({a.trace * 1000 / 25.4:.0f}/{a.gap * 1000 / 25.4:.0f} mil), "
              f"{self.n_fingers} fingers per sensel", "",
              f"Connector J1 ({n} positions: "
-             + (f"FIXED pinout - pins 1-8 = rows (1-{a.rows} used, rest NC), "
-                f"9-16 = columns (1-{a.cols} used, rest NC)"
+             + (f"FIXED pinout - pins 1-8 = columns (1-{a.cols} used, rest "
+                f"NC), 9-16 = rows (1-{a.rows} used, rest NC)"
                 if a.fixed_pins else
-                f"pins 1-{a.rows} = rows, {a.rows + 1}-{n} = columns")
+                f"pins 1-{a.cols} = columns, {a.cols + 1}-{n} = rows")
              + "):"]
         cdesc = {"bottom": "BACK side only", "top": "FRONT side only",
                  "both": "BOTH sides (works with top- or bottom-contact "
