@@ -265,6 +265,7 @@ class Gen:
         self.lib_adds = []          # KiCad-library footprints for pcbnew
         self.gen_lib = {}           # generated footprints -> project FSR.pretty
         self._slack, self._iter = 0.0, 0    # board-dims auto-fit refinement
+        self._extra_w, self._iterw = 0.0, 0
         self.drc_expected = {}              # extra by-design DRC annotations
         self.resolve_geometry()
 
@@ -430,7 +431,8 @@ class Gen:
             conn_need = (self.libbox[3] - self.libbox[2]) + 2.4
         else:
             conn_need = (self.n_pads - 1) * self.conn["pitch"] + 4.4
-        self.board_w = a.board_w or max(self.arr_w + 2 * side_need, conn_need)
+        self.board_w = a.board_w or max(self.arr_w + 2 * side_need
+                                        + self._extra_w, conn_need)
         if self.board_w < conn_need - 1e-6:
             sys.exit(f"board width {self.board_w} mm too narrow for the "
                      f"connector; need >= {conn_need:.1f} mm")
@@ -484,6 +486,7 @@ class Gen:
         self.conn_pitch_min = min(diffs) if diffs else 2.54
         # narrow fan/drop traces when the connector is finer than the comb trace
         self.drop_w = min(a.trace, max(self.conn_pitch_min / 2, 0.2))
+        self.underband = False
         if self.c_rows == 2:
             if self.libpads:
                 pad_sz = 1.7                     # library 2xNN pin header
@@ -491,26 +494,69 @@ class Gen:
                 pad_sz = min(self.conn["pitch"] * 0.5, 1.2)
             else:
                 pad_sz = self.conn["pad"]
+            self.pad_sz2 = pad_sz
             for wc in (0.3, 0.25, 0.2):     # widest that clears the pads
                 if self.colp2 / 2 - pad_sz / 2 - wc / 2 >= 0.199:
                     self.drop_w = min(self.drop_w, wc)
                     break
             else:
-                sys.exit(f"2-row layout not routable: {pad_sz} mm pads at "
-                         f"{self.colp2} mm column pitch leave no room to "
-                         "reach the far row"
-                         + ("" if a.connector_mount == "smd" else
-                            " — try --connector-mount smd"))
+                # no room between columns: reach the far row FROM BELOW via
+                # an escape band between the far pads and the board edge.
+                # Needs the far row to be exactly the COL block (straight
+                # numbering) so one whole layer serves it via-free.
+                far = max(self.pad_cy)
+                far_slots = [i for i in range(self.n_pads)
+                             if abs(self.pad_cy[i] - far) < 0.05]
+                col_block = list(range(self.col_pad0, self.col_pad0 + C))
+                thru_ok = (not self.libpads
+                           or all(p["thru"] for p in self.libpads))
+                if (a.connector_numbering == "straight" and thru_ok
+                        and set(col_block).issubset(set(far_slots))
+                        and self.conn["kind"] in ("tht", "lib")):
+                    self.underband = True
+                    self.pad_dx = list(self.pad_cdx)   # no between-col drops
+                    self.pad_xs = [self.conn_cx + d for d in self.pad_dx]
+                else:
+                    sys.exit(f"2-row layout not routable: {pad_sz} mm pads "
+                             f"at {self.colp2} mm column pitch leave no room "
+                             "to reach the far row — try --connector-mount "
+                             "smd, or --connector-numbering straight with a "
+                             "through-hole connector")
         # x-extent physically occupied by the connector (body, not just pads)
         if self.libpads:
             ox = self.conn_cx - ctr
             self.conn_ext = (ox + self.libbox[2], ox + self.libbox[3])
         else:
             self.conn_ext = (min(self.pad_cxs) - 2.0, max(self.pad_cxs) + 2.0)
+        if self.underband:
+            # escape lanes run down the right side, beyond both the
+            # connector body and the last column bus (all-left approach)
+            self.ub_w, self.ub_ls, self.ub_bs = 0.25, 0.65, 0.65
+            r0 = max(self.conn_ext[1] + 0.5, self.bus_x(C - 1) + 0.8)
+            self.ub_lane = [r0 + c * self.ub_ls for c in range(C)]
+            need_w = self.ub_lane[-1] + 0.8
+            if need_w > self.board_w + 1e-6:
+                if a.board_w:
+                    sys.exit(f"board width {a.board_w} mm too narrow for the "
+                             f"far-row escape lanes; need >= {need_w:.1f} mm")
+                if self._iterw < 4:
+                    self._extra_w += need_w - self.board_w
+                    self._iterw += 1
+                    return self.resolve_geometry()
+            self.conn_ext = (self.conn_ext[0],
+                             max(self.conn_ext[1], self.ub_lane[-1]))
+            if self.libpads:
+                far_off = self.lib_pad_bot - self._lib_ymid
+            else:
+                far_off = max(self.pad_cy) + self.pad_sz2 / 2
+            self.ub_band0 = far_off + 0.55       # first band level, rel pad_y
+            self.ub_tail = far_off + 0.55 + (C - 1) * self.ub_bs + 0.9
 
         # --- column fan grouping / bands ---
+        self.col_tx = (self.ub_lane if self.underband else
+                       [self.pad_xs[self.col_pad0 + c] for c in range(C)])
         self.col_left = [c for c in range(C)
-                         if self.bus_x(c) <= self.pad_xs[self.col_pad0 + c]]
+                         if self.bus_x(c) <= self.col_tx[c]]
         nl, nr = len(self.col_left), C - len(self.col_left)
         col_levels = max(nl, nr)
         self.col_top = self.arr_b + MASK_M + BAND_GAP
@@ -571,6 +617,8 @@ class Gen:
         else:                                # empty strip before the tail
             tail = 3.0
             self.overhang = 0.0
+            if self.underband and self.libbox is None:
+                tail = max(tail, self.ub_tail)
             if self.libbox is not None:
                 if a.connector_angle == "horizontal":
                     # right-angle: only the solder area sits on the board;
@@ -595,6 +643,8 @@ class Gen:
                             "yourself in KiCad")
                 else:                        # keep whole footprint on board
                     tail = max(tail, self.libbox[1] - self._lib_ymid + 1.0)
+                if self.underband:
+                    tail = max(tail, self.ub_tail)
                 if self.lib_flip:
                     # connector copper/body is on B.Cu with the row fans:
                     # keep the fan band above the whole footprint extent
@@ -742,7 +792,7 @@ class Gen:
         fan_layer = "B.Cu" if self.fine_zif else "F.Cu"
         for c in range(C):
             xb = self.bus_x(c)
-            px = self.pad_xs[self.col_pad0 + c]
+            tx = self.col_tx[c]
             if c in self.col_left:
                 y_fan = self.col_deep - self.col_left.index(c) * COL_STEP
             else:
@@ -751,9 +801,23 @@ class Gen:
             self.seg(xb, self.arr_y + self.sensel_h, xb, y_fan, "B.Cu", self.cnet(c))
             if not self.fine_zif:
                 self.via(xb, y_fan, self.cnet(c))
-            self.seg(xb, y_fan, px, y_fan, fan_layer, self.cnet(c), self.drop_w)
-            self.drop_to_pad(px, y_fan, self.cnet(c), self.col_pad0 + c,
-                             from_layer=fan_layer)
+            self.seg(xb, y_fan, tx, y_fan, fan_layer, self.cnet(c), self.drop_w)
+            if self.underband:
+                # far row entered from below: F.Cu side lane down to a via,
+                # then the band and pad stub run on B.Cu (cross-layer, so
+                # deep lanes never conflict with shallower bands)
+                i = self.col_pad0 + c
+                net, w = self.cnet(c), self.ub_w
+                band_y = self.pad_y + self.ub_band0 + (C - 1 - c) * self.ub_bs
+                py = self.pad_y + self.pad_cy[i]
+                self.seg(tx, y_fan, tx, band_y, "F.Cu", net, w)
+                self.via(tx, band_y, net)
+                self.seg(tx, band_y, self.pad_cxs[i], band_y, "B.Cu", net, w)
+                self.seg(self.pad_cxs[i], band_y, self.pad_cxs[i], py,
+                         "B.Cu", net, w)
+            else:
+                self.drop_to_pad(tx, y_fan, self.cnet(c), self.col_pad0 + c,
+                                 from_layer=fan_layer)
 
         # 3. row escapes: top half left, bottom half right (B.Cu) --
         for r in range(R):
