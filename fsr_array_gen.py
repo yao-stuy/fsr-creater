@@ -378,13 +378,27 @@ class Gen:
             if a.connector_mount == "smd":
                 self.conn["kind"] = "smd"
 
-        # --- side margins: row escapes split left/right ---
+        # --- side margins: row escapes ---
         # Fine-pitch (<0.9 mm) ZIF: vias can't fit between the drop columns,
         # so columns must reach the B.Cu fingers without a layer change.
         # Routing ALL rows out the right keeps the left half of B.Cu free
         # (cols = pins 1..C = left block), so columns stay on B.Cu.
         self.fine_zif = (a.connector == "zif" and self.conn["pitch"] < 0.9)
-        self.kL = 0 if self.fine_zif else (R + 1) // 2
+        # General case (single-row connector): rows stay on F.Cu end to end
+        # (no via) and columns stay on B.Cu end to end (no via), so the two
+        # families never share a layer and their fan regions can overlap.
+        # This requires ALL rows to exit the SAME side, and specifically
+        # the side where the margin sits BETWEEN the array and the pad
+        # cluster (margin-x closer to center than pad-x is impossible; the
+        # left margin is always left of every pad, so left works
+        # universally) -- splitting left/right creates two opposite-sign
+        # depth-ordering requirements for a row's horizontal-vs-neighboring
+        # -row conflicts that cannot both be satisfied on one layer.
+        # c_rows==2 (dual-row headers, "underband" scenario) keeps the
+        # original via'd/split design; that pad geometry isn't covered by
+        # this argument.
+        self.rows_no_via = (not self.fine_zif) and self.c_rows == 1
+        self.kL = R if self.rows_no_via else (0 if self.fine_zif else (R + 1) // 2)
         self.kR = R - self.kL
         side_need = (EDGE_KEEP + VIA_OFF
                      + max(max(self.kL, self.kR) - 1, 0) * STAG_R)
@@ -555,10 +569,15 @@ class Gen:
         self.col_top = self.arr_b + MASK_M + BAND_GAP
         self.col_deep = self.col_top + max(col_levels - 1, 0) * COL_STEP
         # underband: rows bypass the fan region entirely (they wrap around
-        # the connector to the far row), so no row band is reserved
+        # the connector to the far row), so no row band is reserved.
+        # rows_no_via: rows are on F.Cu, columns on B.Cu -- different
+        # layers, so the row band can start right after the array instead
+        # of stacking below the column band.
         row_levels = 0 if self.underband else max(self.kL, self.kR)
-        self.row_top = self.col_deep + (BAND_GAP if row_levels else 0)
+        self.row_top = (self.arr_b + MASK_M + BAND_GAP if self.rows_no_via
+                        else self.col_deep + (BAND_GAP if row_levels else 0))
         self.row_deep = self.row_top + max(row_levels - 1, 0) * ROW_STEP
+        self.deep = max(self.col_deep, self.row_deep)   # fan region bottom
 
         # --- connector y / board height ---
         self.drop_gap = (max(2.6, self.hole_d / 2 + 1.15)
@@ -568,6 +587,13 @@ class Gen:
             ph = round(self.conn["pitch"] - 0.5, 2)
             self.drop_gap = max(self.drop_gap,
                                 2.2 + ph / 2 - min(self.pad_cy))
+        if self.rows_no_via and self.libbox is not None:
+            # rows_no_via puts the deepest row level right up against the
+            # pad row (that's what avoids row-vs-row crossings); some
+            # library SMD footprints stagger pads vertically even at
+            # c_rows==1 (e.g. the SMD pin header), so clear the whole
+            # footprint's real extent, not just the nominal pad_y line
+            self.drop_gap = max(self.drop_gap, 0.6 - self.libbox[0])
         self.edge_rule = None
         if a.connector == "zif":
             self.tail_len = max(a.tail_len, 5.0)
@@ -608,7 +634,7 @@ class Gen:
                     "ZIF socket (needs ~0.30 mm) — use --style fpc, or order "
                     "controlled-depth milling for the tail")
             tail = 0.0
-            min_h = self.row_deep + 1.5      # body hugs the routing: no
+            min_h = self.deep + 1.5         # body hugs the routing: no
         else:                                # empty strip before the tail
             tail = 3.0
             self.overhang = 0.0
@@ -646,7 +672,7 @@ class Gen:
                     self.drop_gap = max(
                         self.drop_gap,
                         self._lib_ymid - self.libbox[0] + 0.6)
-            min_h = self.row_deep + self.drop_gap + tail
+            min_h = self.deep + self.drop_gap + tail
             if getattr(self, "body_up", 0):
                 min_h = max(min_h,
                             self.arr_b + MASK_M + 0.4 + self.body_up + tail)
@@ -781,10 +807,14 @@ class Gen:
                 self.via(self.bus_x(c), y_bot, self.cnet(c))
 
         # 2. column buses (B.Cu) + fan ----------------------------
-        # Normally the fan hops to F.Cu so it can cross the row band.  For
-        # fine-pitch ZIF all rows exited left, so the fan stays on B.Cu
-        # (nesting argument unchanged) and reaches the fingers via-free.
-        fan_layer = "B.Cu" if self.fine_zif else "F.Cu"
+        # Columns stay on B.Cu the whole way (no via) only when the row
+        # family has actually vacated B.Cu: rows_no_via (rows on F.Cu
+        # instead) or fine_zif (rows spatially confined to the opposite
+        # side). Otherwise (c_rows==2 / underband-eligible) rows still via
+        # to B.Cu using the original design, so columns must hop to F.Cu
+        # to avoid colliding with them there, as before.
+        col_stays_bcu = self.rows_no_via or self.fine_zif
+        fan_layer = "B.Cu" if col_stays_bcu else "F.Cu"
         for c in range(C):
             xb = self.bus_x(c)
             tx = self.col_tx[c]
@@ -794,13 +824,13 @@ class Gen:
                 right = [x for x in range(C) if x not in self.col_left]
                 y_fan = self.col_deep - (len(right) - 1 - right.index(c)) * COL_STEP
             self.seg(xb, self.arr_y + self.sensel_h, xb, y_fan, "B.Cu", self.cnet(c))
-            if not self.fine_zif:
+            if not col_stays_bcu:
                 self.via(xb, y_fan, self.cnet(c))
             self.seg(xb, y_fan, tx, y_fan, fan_layer, self.cnet(c), self.drop_w)
             self.drop_to_pad(tx, y_fan, self.cnet(c), self.col_pad0 + c,
                              from_layer=fan_layer)
 
-        # 3. row escapes: top half left, bottom half right (B.Cu) --
+        # 3. row escapes: all left (rows_no_via) or top-left/bottom-right --
         for r in range(R):
             y_top = self.arr_y + r * self.pitch_y
             slot = self.row_pad0 + r
@@ -835,10 +865,19 @@ class Gen:
                 x_v = self.arr_r + VIA_OFF + j * STAG_R
                 y_fan = self.row_deep - (self.kR - 1 - j) * ROW_STEP
                 self.seg(self.arr_r, y_top, x_v, y_top, "F.Cu", self.rnet(r))
-            self.via(x_v, y_top, self.rnet(r))
-            self.seg(x_v, y_top, x_v, y_fan, "B.Cu", self.rnet(r))
-            self.seg(x_v, y_fan, px, y_fan, "B.Cu", self.rnet(r), self.drop_w)
-            self.drop_to_pad(px, y_fan, self.rnet(r), slot, from_layer="B.Cu")
+            # rows_no_via: rows are already on F.Cu (their spines are
+            # already on top); stay there through the fan and into the
+            # pad -- no via -- so the row family owns F.Cu completely.
+            # Otherwise (fine_zif, or c_rows==2/underband-eligible), keep
+            # the original via to B.Cu.
+            if self.rows_no_via:
+                lay = "F.Cu"
+            else:
+                self.via(x_v, y_top, self.rnet(r))
+                lay = "B.Cu"
+            self.seg(x_v, y_top, x_v, y_fan, lay, self.rnet(r))
+            self.seg(x_v, y_fan, px, y_fan, lay, self.rnet(r), self.drop_w)
+            self.drop_to_pad(px, y_fan, self.rnet(r), slot, from_layer=lay)
 
         # 4. connector --------------------------------------------
         self.make_connector()
@@ -854,7 +893,7 @@ class Gen:
                 bx0 = self.conn_ext[0] - (self.hole_half + 0.6)
                 bx1 = self.conn_ext[1] + (self.hole_half + 0.6)
                 # below the row fan band, above the board edge
-                by_min = self.row_deep + self.hole_d / 2 + 0.55
+                by_min = self.deep + self.hole_d / 2 + 0.55
                 by_max = self.board_h - self.hole_d / 2 - 0.9
                 by = max(min(self.pad_y, by_max), by_min)
                 if not (bx0 - self.hole_half - 0.5 > 0 and
@@ -933,7 +972,7 @@ class Gen:
             else:
                 base = self.pad_y + (min(self.pad_cy) if self.c_rows == 2
                                      else self.pad_cy[pad_idx])
-                yv = (max(self.row_deep + 0.9, base - 2.0)
+                yv = (max(self.deep + 0.9, base - 2.0)
                       + (0.8 if pad_idx % 2 else 0))
                 self.seg(px, y_fan, px, yv, from_layer, net, w)
                 self.via(px, yv, net)
@@ -970,7 +1009,7 @@ class Gen:
                 # for 2-row connectors, above the whole pad field
                 base = self.pad_y + (min(self.pad_cy) if self.c_rows == 2
                                      else self.pad_cy[pad_idx])
-                yv = (max(self.row_deep + 0.9, base - 2.0)
+                yv = (max(self.deep + 0.9, base - 2.0)
                       + (0.8 if pad_idx % 2 else 0))            # stagger vias
                 self.seg(px, y_fan, px, yv, from_layer, net, w)
                 self.via(px, yv, net)
