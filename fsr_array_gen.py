@@ -387,18 +387,23 @@ class Gen:
         # General case (single-row connector): rows stay on F.Cu end to end
         # (no via) and columns stay on B.Cu end to end (no via), so the two
         # families never share a layer and their fan regions can overlap.
-        # This requires ALL rows to exit the SAME side, and specifically
-        # the side where the margin sits BETWEEN the array and the pad
-        # cluster (margin-x closer to center than pad-x is impossible; the
-        # left margin is always left of every pad, so left works
-        # universally) -- splitting left/right creates two opposite-sign
-        # depth-ordering requirements for a row's horizontal-vs-neighboring
-        # -row conflicts that cannot both be satisfied on one layer.
+        # Rows still split top-half-left / bottom-half-right for a
+        # symmetric board. The right side alone would be uncrossable with
+        # sequential pin numbering (the row closest to the array needs the
+        # outermost margin AND deepest fan level to clear other rows'
+        # stubs, but the shallowest level to clear other rows' pad drops --
+        # contradictory under a fixed row->pin mapping). Pin order is only
+        # a labelling choice, though: row_slot() reverses the right side's
+        # pin assignment within its own block (row closest to the array
+        # gets the pin farthest from the left group), which makes the
+        # margin-position ordering (fixed by physical position) and the
+        # pad-position ordering (now free) point the same way -- resolving
+        # all three pairwise crossing constraints simultaneously.
         # c_rows==2 (dual-row headers, "underband" scenario) keeps the
         # original via'd/split design; that pad geometry isn't covered by
         # this argument.
         self.rows_no_via = (not self.fine_zif) and self.c_rows == 1
-        self.kL = R if self.rows_no_via else (0 if self.fine_zif else (R + 1) // 2)
+        self.kL = 0 if self.fine_zif else (R + 1) // 2
         self.kR = R - self.kL
         side_need = (EDGE_KEEP + VIA_OFF
                      + max(max(self.kL, self.kR) - 1, 0) * STAG_R)
@@ -744,6 +749,20 @@ class Gen:
     def rnet(self, r): return r + 1
     def cnet(self, c): return self.a.rows + c + 1
 
+    def row_slot(self, r):
+        """Pin slot index for physical row r. When rows_no_via, the right
+        side's pin assignment is reversed within its own block (row
+        closest to the array gets the pin farthest from the left group)
+        -- this is what makes the row's margin-position ordering (fixed by
+        physical position) and pad-position ordering (free to choose)
+        point the same way, which is required for single-layer, no-via
+        routing to be crossing-free on the right side too. See the row
+        escape / drop_to_pad math for the derivation."""
+        if self.rows_no_via and r >= self.kL:
+            j = r - self.kL
+            return self.row_pad0 + self.kL + (self.kR - 1 - j)
+        return self.row_pad0 + r
+
     def gen_footprint(self, name, layer, attr, texts, pads, x, y):
         """Generated footprint: embed in the board AND store a .kicad_mod
         copy for the project's FSR.pretty library (so KiCad's config check
@@ -833,7 +852,7 @@ class Gen:
         # 3. row escapes: all left (rows_no_via) or top-left/bottom-right --
         for r in range(R):
             y_top = self.arr_y + r * self.pitch_y
-            slot = self.row_pad0 + r
+            slot = self.row_slot(r)
             px = self.pad_xs[slot]
             if self.underband:
                 # wrap around the connector: continue down the margin and
@@ -862,8 +881,17 @@ class Gen:
                 self.seg(self.arr_x, y_top, x_v, y_top, "F.Cu", self.rnet(r))
             else:                                      # right side
                 j = r - self.kL
-                x_v = self.arr_r + VIA_OFF + j * STAG_R
-                y_fan = self.row_deep - (self.kR - 1 - j) * ROW_STEP
+                if self.rows_no_via:
+                    # Row closest to the array needs BOTH the outermost
+                    # margin (clears later rows' array-edge stubs) AND the
+                    # deepest fan level (its horizontal, reaching nearly to
+                    # the pad cluster, then clears later rows' drops) --
+                    # row_slot()'s pin reversal makes this consistent.
+                    x_v = self.arr_r + VIA_OFF + (self.kR - 1 - j) * STAG_R
+                    y_fan = self.row_deep - j * ROW_STEP
+                else:
+                    x_v = self.arr_r + VIA_OFF + j * STAG_R
+                    y_fan = self.row_deep - (self.kR - 1 - j) * ROW_STEP
                 self.seg(self.arr_r, y_top, x_v, y_top, "F.Cu", self.rnet(r))
             # rows_no_via: rows are already on F.Cu (their spines are
             # already on top); stay there through the fan and into the
@@ -1024,7 +1052,7 @@ class Gen:
         for c in range(self.a.cols):
             names[self.col_pad0 + c] = f"COL{c + 1}"
         for r in range(self.a.rows):
-            names[self.row_pad0 + r] = f"ROW{r + 1}"
+            names[self.row_slot(r)] = f"ROW{r + 1}"
         return names
 
     def pad_nets(self):
@@ -1033,7 +1061,7 @@ class Gen:
         for c in range(self.a.cols):
             nets[self.col_pad0 + c] = (self.cnet(c), f"COL{c + 1}")
         for r in range(self.a.rows):
-            nets[self.row_pad0 + r] = (self.rnet(r), f"ROW{r + 1}")
+            nets[self.row_slot(r)] = (self.rnet(r), f"ROW{r + 1}")
         return nets
 
     def pin_labels(self):
@@ -1062,6 +1090,10 @@ class Gen:
             ly = self.pad_y + 2.6
             if ly > self.board_h - 0.9:
                 ly = self.pad_y - 2.6
+        # on a small board the "above the connector" fallback can land
+        # close enough to the array's column-index row to collide with it
+        if abs(ly - (self.arr_b + MASK_M + 1.2)) < 2.0:
+            return
         for i, name in enumerate(self.pad_names()):
             lbl = name.replace("ROW", "R").replace("COL", "C") or "NC"
             self.text(lbl, self.pad_xs[i], ly, "B.SilkS", 0.8)
